@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+.DS_Store
+.vscode/
+
 # Distribution / packaging
 .Python
 build/
@@ -143,6 +146,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.mplconfig/
+splitter_outputs/
 
 # Spyder project settings
 .spyderproject

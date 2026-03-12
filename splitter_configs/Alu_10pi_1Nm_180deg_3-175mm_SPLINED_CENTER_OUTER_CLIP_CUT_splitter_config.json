@@ -1,0 +1,182 @@
+{
+  "source_dxf": "/Users/luke/Phd/spiral-stl-segmenter/dxf_files/Alu_10pi_1Nm_180deg_3-175mm_SPLINED_CENTER_OUTER_CLIP_CUT.DXF",
+  "source_dxf_rel": "dxf_files/Alu_10pi_1Nm_180deg_3-175mm_SPLINED_CENTER_OUTER_CLIP_CUT.DXF",
+  "n_sections": 12,
+  "auto_gap": 0.5,
+  "assignments": {
+    "upper_edge": [
+      {
+        "idx": 13,
+        "reverse": false
+      }
+    ],
+    "lower_edge": [
+      {
+        "idx": 9,
+        "reverse": false
+      }
+    ],
+    "outer_fixture": [
+      {
+        "idx": 40,
+        "reverse": false
+      },
+      {
+        "idx": 39,
+        "reverse": false
+      },
+      {
+        "idx": 3,
+        "reverse": false
+      },
+      {
+        "idx": 5,
+        "reverse": false
+      },
+      {
+        "idx": 6,
+        "reverse": false
+      },
+      {
+        "idx": 4,
+        "reverse": false
+      },
+      {
+        "idx": 7,
+        "reverse": false
+      },
+      {
+        "idx": 2,
+        "reverse": false
+      },
+      {
+        "idx": 0,
+        "reverse": false
+      },
+      {
+        "idx": 14,
+        "reverse": false
+      },
+      {
+        "idx": 1,
+        "reverse": false
+      },
+      {
+        "idx": 8,
+        "reverse": false
+      }
+    ],
+    "inner_transition": [
+      {
+        "idx": 12,
+        "reverse": false
+      },
+      {
+        "idx": 11,
+        "reverse": false
+      },
+      {
+        "idx": 10,
+        "reverse": false
+      }
+    ],
+    "inner_cutout": [
+      {
+        "idx": 35,
+        "reverse": false
+      },
+      {
+        "idx": 34,
+        "reverse": false
+      },
+      {
+        "idx": 31,
+        "reverse": false
+      },
+      {
+        "idx": 29,
+        "reverse": false
+      },
+      {
+        "idx": 25,
+        "reverse": false
+      },
+      {
+        "idx": 24,
+        "reverse": false
+      },
+      {
+        "idx": 23,
+        "reverse": false
+      },
+      {
+        "idx": 21,
+        "reverse": false
+      },
+      {
+        "idx": 19,
+        "reverse": false
+      },
+      {
+        "idx": 28,
+        "reverse": false
+      },
+      {
+        "idx": 22,
+        "reverse": false
+      },
+      {
+        "idx": 20,
+        "reverse": false
+      },
+      {
+        "idx": 18,
+        "reverse": false
+      },
+      {
+        "idx": 17,
+        "reverse": false
+      },
+      {
+        "idx": 15,
+        "reverse": false
+      },
+      {
+        "idx": 37,
+        "reverse": false
+      },
+      {
+        "idx": 16,
+        "reverse": false
+      },
+      {
+        "idx": 38,
+        "reverse": false
+      },
+      {
+        "idx": 36,
+        "reverse": false
+      },
+      {
+        "idx": 33,
+        "reverse": false
+      },
+      {
+        "idx": 32,
+        "reverse": false
+      },
+      {
+        "idx": 30,
+        "reverse": false
+      },
+      {
+        "idx": 26,
+        "reverse": false
+      },
+      {
+        "idx": 27,
+        "reverse": false
+      }
+    ]
+  }
+}

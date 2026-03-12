@@ -34,9 +34,13 @@ Tkinter is included with most Python installs.
 
 from __future__ import annotations
 
+import csv
 import json
 import math
+import os
+import sys
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -45,12 +49,16 @@ import numpy as np
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+MPLCONFIG_DIR = PROJECT_ROOT / ".mplconfig"
+MPLCONFIG_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(MPLCONFIG_DIR))
+
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
-PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DXF_DIR = PROJECT_ROOT / "dxf_files"
 DEFAULT_CONFIG_DIR = PROJECT_ROOT / "splitter_configs"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "splitter_outputs"
@@ -62,8 +70,30 @@ CATEGORIES = [
     "outer_fixture",
     "inner_transition",
     "inner_cutout",
-    "hole_circles",
 ]
+
+CATEGORY_META = {
+    "upper_edge": {
+        "label": "Upper spring edge",
+        "description": "One of the two main spring edges that will be split into sections.",
+    },
+    "lower_edge": {
+        "label": "Lower spring edge",
+        "description": "The other main spring edge that will be split into sections.",
+    },
+    "outer_fixture": {
+        "label": "Outer fixture + holes",
+        "description": "Entire outer-end fixture geometry. Circular holes belong here and export as one DXF.",
+    },
+    "inner_transition": {
+        "label": "Transition region",
+        "description": "Geometry bridging from the spring strip into the inner ring. Exports together with the inner ring.",
+    },
+    "inner_cutout": {
+        "label": "Splined inner ring",
+        "description": "Entire inner splined ring / arbor-end geometry. Exports together with the transition region.",
+    },
+}
 
 CHAINABLE_CATEGORIES = {
     "upper_edge",
@@ -74,19 +104,37 @@ CHAINABLE_CATEGORIES = {
 }
 
 CHAINABLE_TYPES = {"LINE", "ARC", "SPLINE"}
+DRAWABLE_TYPES = CHAINABLE_TYPES | {"CIRCLE"}
+CATEGORY_ALLOWED_TYPES = {
+    "upper_edge": CHAINABLE_TYPES,
+    "lower_edge": CHAINABLE_TYPES,
+    "outer_fixture": DRAWABLE_TYPES,
+    "inner_transition": CHAINABLE_TYPES,
+    "inner_cutout": CHAINABLE_TYPES,
+}
+MANUAL_KERF_CATEGORIES = {"outer_fixture", "inner_transition", "inner_cutout"}
+
+
+def category_label(cat: str) -> str:
+    return CATEGORY_META[cat]["label"]
 
 
 @dataclass
 class AssignmentItem:
     idx: int
     reverse: bool = False
+    kerf_flip: bool = False
 
     def to_json(self):
-        return {"idx": self.idx, "reverse": self.reverse}
+        return {"idx": self.idx, "reverse": self.reverse, "kerf_flip": self.kerf_flip}
 
     @staticmethod
     def from_json(obj):
-        return AssignmentItem(idx=int(obj["idx"]), reverse=bool(obj.get("reverse", False)))
+        return AssignmentItem(
+            idx=int(obj["idx"]),
+            reverse=bool(obj.get("reverse", False)),
+            kerf_flip=bool(obj.get("kerf_flip", False)),
+        )
 
 
 # =========================
@@ -230,30 +278,160 @@ def path_from_assignment_list(entities, items: List[AssignmentItem]) -> np.ndarr
     return np.vstack(pieces)
 
 
+def paths_from_assignment_list(entities, items: List[AssignmentItem], join_tol: float = 1e-6) -> List[np.ndarray]:
+    paths = []
+    current = None
+
+    for item in items:
+        pts = sample_entity(entities, item.idx, reverse=item.reverse)
+        if current is None:
+            current = pts.copy()
+            continue
+
+        if np.linalg.norm(current[-1] - pts[0]) < join_tol:
+            current = np.vstack([current, pts[1:]])
+        else:
+            paths.append(current)
+            current = pts.copy()
+
+    if current is not None:
+        paths.append(current)
+
+    return paths
+
+
+def geometry_points_from_assignments(entities, items: List[AssignmentItem]) -> np.ndarray:
+    clouds = []
+    for item in items:
+        try:
+            clouds.append(sample_entity(entities, item.idx, reverse=item.reverse))
+        except Exception:
+            continue
+    if not clouds:
+        return np.empty((0, 2), dtype=float)
+    return np.vstack(clouds)
+
+
+def geometry_points_from_circles(circles: List[Tuple[float, float, float]], n: int = 120) -> np.ndarray:
+    clouds = []
+    for cx, cy, r in circles:
+        th = np.linspace(0.0, 2.0 * math.pi, n)
+        clouds.append(np.column_stack([cx + r * np.cos(th), cy + r * np.sin(th)]))
+    if not clouds:
+        return np.empty((0, 2), dtype=float)
+    return np.vstack(clouds)
+
+
+def point_cloud_distance(point: np.ndarray, cloud: np.ndarray) -> float:
+    if len(cloud) == 0:
+        return float("inf")
+    return float(np.min(np.linalg.norm(cloud - point, axis=1)))
+
+
+def path_runs_inner_to_outer(path_pts: np.ndarray, inner_cloud: np.ndarray, outer_cloud: np.ndarray) -> bool:
+    start = path_pts[0]
+    end = path_pts[-1]
+
+    natural_score = 0.0
+    reversed_score = 0.0
+    used_anchor = False
+
+    if len(inner_cloud) > 0:
+        natural_score += point_cloud_distance(start, inner_cloud)
+        reversed_score += point_cloud_distance(end, inner_cloud)
+        used_anchor = True
+
+    if len(outer_cloud) > 0:
+        natural_score += point_cloud_distance(end, outer_cloud)
+        reversed_score += point_cloud_distance(start, outer_cloud)
+        used_anchor = True
+
+    if not used_anchor:
+        return False
+
+    return natural_score <= reversed_score
+
+
 # =========================
 # Output DXF writing
 # =========================
 
-def dxf_header() -> str:
-    return "\n".join([
+def dxf_header(layers: List[str]) -> str:
+    unique_layers = ["0"]
+    for layer in layers:
+        if layer not in unique_layers:
+            unique_layers.append(layer)
+
+    out = [
         "0", "SECTION",
         "2", "HEADER",
         "9", "$ACADVER",
-        "1", "AC1015",
+        "1", "AC1009",
+        "0", "ENDSEC",
+        "0", "SECTION",
+        "2", "TABLES",
+        "0", "TABLE",
+        "2", "LTYPE",
+        "70", "1",
+        "0", "LTYPE",
+        "2", "CONTINUOUS",
+        "70", "64",
+        "3", "Solid line",
+        "72", "65",
+        "73", "0",
+        "40", "0.0",
+        "0", "ENDTAB",
+        "0", "TABLE",
+        "2", "LAYER",
+        "70", str(len(unique_layers)),
+    ]
+
+    for i, layer in enumerate(unique_layers):
+        color = 7 if i == 0 else ((i % 255) or 7)
+        out.extend([
+            "0", "LAYER",
+            "2", layer,
+            "70", "0",
+            "62", str(color),
+            "6", "CONTINUOUS",
+        ])
+
+    out.extend([
+        "0", "ENDTAB",
+        "0", "ENDSEC",
+        "0", "SECTION",
+        "2", "BLOCKS",
         "0", "ENDSEC",
         "0", "SECTION",
         "2", "ENTITIES",
-    ]) + "\n"
+    ])
+    return "\n".join(out) + "\n"
 
 
 def dxf_footer() -> str:
     return "\n".join(["0", "ENDSEC", "0", "EOF"]) + "\n"
 
 
-def lwpolyline_entity(points: np.ndarray, layer: str) -> str:
-    out = ["0", "LWPOLYLINE", "8", layer, "90", str(len(points)), "70", "0"]
+def polyline_entity(points: np.ndarray, layer: str) -> str:
+    out = [
+        "0", "POLYLINE",
+        "8", layer,
+        "10", "0.0",
+        "20", "0.0",
+        "30", "0.0",
+        "66", "1",
+        "70", "0",
+    ]
     for x, y in points:
-        out += ["10", f"{x:.9f}", "20", f"{y:.9f}"]
+        out += [
+            "0", "VERTEX",
+            "8", layer,
+            "10", f"{x:.9f}",
+            "20", f"{y:.9f}",
+            "30", "0.0",
+            "70", "0",
+        ]
+    out += ["0", "SEQEND"]
     return "\n".join(out) + "\n"
 
 
@@ -266,6 +444,634 @@ def circle_entity(cx: float, cy: float, r: float, layer: str) -> str:
         "30", "0.0",
         "40", f"{r:.9f}",
     ]) + "\n"
+
+
+def build_dxf_content(
+    polylines: List[Tuple[np.ndarray, str]],
+    circles: Optional[List[Tuple[float, float, float, str]]] = None,
+) -> str:
+    layers = [layer for _, layer in polylines]
+    layers.extend(layer for *_rest, layer in (circles or []))
+    content = dxf_header(layers)
+    for pts, layer in polylines:
+        content += polyline_entity(pts, layer)
+    for cx, cy, r, layer in circles or []:
+        content += circle_entity(cx, cy, r, layer)
+    content += dxf_footer()
+    return content
+
+
+def bbox_from_export_geometry(
+    polylines: List[Tuple[np.ndarray, str]],
+    circles: Optional[List[Tuple[float, float, float, str]]] = None,
+) -> Optional[Tuple[float, float, float, float]]:
+    xmins = []
+    ymins = []
+    xmaxs = []
+    ymaxs = []
+
+    for pts, _layer in polylines:
+        if len(pts) == 0:
+            continue
+        mins = pts.min(axis=0)
+        maxs = pts.max(axis=0)
+        xmins.append(float(mins[0]))
+        ymins.append(float(mins[1]))
+        xmaxs.append(float(maxs[0]))
+        ymaxs.append(float(maxs[1]))
+
+    for cx, cy, r, _layer in circles or []:
+        xmins.append(float(cx - r))
+        ymins.append(float(cy - r))
+        xmaxs.append(float(cx + r))
+        ymaxs.append(float(cy + r))
+
+    if not xmins:
+        return None
+
+    return min(xmins), min(ymins), max(xmaxs), max(ymaxs)
+
+
+def union_bbox(bboxes: List[Optional[Tuple[float, float, float, float]]]) -> Optional[Tuple[float, float, float, float]]:
+    valid = [bbox for bbox in bboxes if bbox is not None]
+    if not valid:
+        return None
+
+    return (
+        min(bbox[0] for bbox in valid),
+        min(bbox[1] for bbox in valid),
+        max(bbox[2] for bbox in valid),
+        max(bbox[3] for bbox in valid),
+    )
+
+
+def dedupe_consecutive_points(pts: np.ndarray, tol: float = 1e-9) -> np.ndarray:
+    if len(pts) <= 1:
+        return pts.copy()
+
+    keep = [0]
+    for i in range(1, len(pts)):
+        if np.linalg.norm(pts[i] - pts[keep[-1]]) > tol:
+            keep.append(i)
+    return pts[keep].copy()
+
+
+def normalize_vector(v: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n < 1e-12:
+        return np.array([0.0, 0.0], dtype=float)
+    return v / n
+
+
+def cross2d(a: np.ndarray, b: np.ndarray) -> float:
+    return float(a[0] * b[1] - a[1] * b[0])
+
+
+def line_intersection(p1: np.ndarray, d1: np.ndarray, p2: np.ndarray, d2: np.ndarray) -> Optional[np.ndarray]:
+    denom = cross2d(d1, d2)
+    if abs(denom) < 1e-12:
+        return None
+    t = cross2d(p2 - p1, d2) / denom
+    return p1 + t * d1
+
+
+def polyline_vertex_tangents(pts: np.ndarray, closed: bool = False) -> np.ndarray:
+    pts = dedupe_consecutive_points(pts)
+    if len(pts) < 2:
+        return np.zeros((len(pts), 2), dtype=float)
+
+    tangents = np.zeros_like(pts, dtype=float)
+    n = len(pts)
+    for i in range(n):
+        if closed:
+            prev_pt = pts[(i - 1) % n]
+            next_pt = pts[(i + 1) % n]
+        elif i == 0:
+            prev_pt = pts[i]
+            next_pt = pts[i + 1]
+        elif i == n - 1:
+            prev_pt = pts[i - 1]
+            next_pt = pts[i]
+        else:
+            prev_pt = pts[i - 1]
+            next_pt = pts[i + 1]
+        tangents[i] = normalize_vector(next_pt - prev_pt)
+
+    return tangents
+
+
+def offset_polyline(points: np.ndarray, distance: float, sign: float, closed: bool = False) -> np.ndarray:
+    pts = dedupe_consecutive_points(points)
+    if len(pts) < 2 or abs(distance) < 1e-12:
+        return pts.copy()
+
+    is_closed = closed or np.linalg.norm(pts[0] - pts[-1]) < 1e-7
+    base = pts[:-1].copy() if is_closed else pts.copy()
+    if len(base) < 2:
+        return pts.copy()
+
+    seg_dirs = []
+    seg_normals = []
+    segment_count = len(base) if is_closed else len(base) - 1
+    for i in range(segment_count):
+        p0 = base[i]
+        p1 = base[(i + 1) % len(base)]
+        d = normalize_vector(p1 - p0)
+        if np.linalg.norm(d) < 1e-12:
+            continue
+        seg_dirs.append(d)
+        seg_normals.append(sign * np.array([-d[1], d[0]], dtype=float))
+
+    if not seg_dirs:
+        return pts.copy()
+
+    if is_closed:
+        out = []
+        n = len(base)
+        for i in range(n):
+            prev_idx = (i - 1) % n
+            curr_idx = i % n
+            prev_line_point = base[i] + distance * seg_normals[prev_idx]
+            curr_line_point = base[i] + distance * seg_normals[curr_idx]
+            inter = line_intersection(prev_line_point, seg_dirs[prev_idx], curr_line_point, seg_dirs[curr_idx])
+            if inter is None:
+                avg_normal = normalize_vector(seg_normals[prev_idx] + seg_normals[curr_idx])
+                if np.linalg.norm(avg_normal) < 1e-12:
+                    avg_normal = seg_normals[curr_idx]
+                inter = base[i] + distance * avg_normal
+            out.append(inter)
+        out = np.asarray(out, dtype=float)
+        return np.vstack([out, out[0]])
+
+    out = [base[0] + distance * seg_normals[0]]
+    for i in range(1, len(base) - 1):
+        prev_line_point = base[i] + distance * seg_normals[i - 1]
+        curr_line_point = base[i] + distance * seg_normals[i]
+        inter = line_intersection(prev_line_point, seg_dirs[i - 1], curr_line_point, seg_dirs[i])
+        if inter is None:
+            avg_normal = normalize_vector(seg_normals[i - 1] + seg_normals[i])
+            if np.linalg.norm(avg_normal) < 1e-12:
+                avg_normal = seg_normals[i]
+            inter = base[i] + distance * avg_normal
+        out.append(inter)
+    out.append(base[-1] + distance * seg_normals[-1])
+    return np.asarray(out, dtype=float)
+
+
+def estimate_offset_sign_away_from_reference(path_pts: np.ndarray, reference_cloud: np.ndarray) -> float:
+    pts = dedupe_consecutive_points(path_pts)
+    if len(pts) < 2 or len(reference_cloud) == 0:
+        return 1.0
+
+    tangents = polyline_vertex_tangents(pts)
+    normals = np.column_stack([-tangents[:, 1], tangents[:, 0]])
+    sample_count = min(len(pts), 31)
+    sample_indices = np.unique(np.linspace(0, len(pts) - 1, sample_count).astype(int))
+
+    dots = []
+    for idx in sample_indices:
+        point = pts[idx]
+        deltas = reference_cloud - point
+        if len(deltas) == 0:
+            continue
+        nearest_idx = int(np.argmin(np.einsum("ij,ij->i", deltas, deltas)))
+        nearest_vec = deltas[nearest_idx]
+        if np.linalg.norm(nearest_vec) < 1e-9:
+            continue
+        dot = float(np.dot(normals[idx], nearest_vec))
+        if abs(dot) > 1e-9:
+            dots.append(dot)
+
+    if not dots:
+        return 1.0
+
+    return -1.0 if float(np.median(dots)) > 0.0 else 1.0
+
+
+def smooth_isolated_sign_outliers(signs: List[float]) -> List[float]:
+    if len(signs) < 3:
+        return list(signs)
+
+    smoothed = list(signs)
+    radius = 2
+    for i in range(len(signs)):
+        lo = max(0, i - radius)
+        hi = min(len(signs), i + radius + 1)
+        window = signs[lo:hi]
+        pos = sum(1 for sign in window if sign > 0.0)
+        neg = sum(1 for sign in window if sign < 0.0)
+        if pos == neg:
+            continue
+        majority = 1.0 if pos > neg else -1.0
+        if signs[i] != majority:
+            smoothed[i] = majority
+
+    return smoothed
+
+
+def offset_polyline_away_from_reference(
+    path_pts: np.ndarray,
+    reference_cloud: np.ndarray,
+    distance: float,
+    sign_override: Optional[float] = None,
+) -> np.ndarray:
+    if distance <= 0.0:
+        return path_pts.copy()
+    sign = sign_override if sign_override is not None else estimate_offset_sign_away_from_reference(path_pts, reference_cloud)
+    is_closed = np.linalg.norm(path_pts[0] - path_pts[-1]) < 1e-7
+    return offset_polyline(path_pts, distance, sign=sign, closed=is_closed)
+
+
+def offset_paths_away_from_reference(
+    paths: List[np.ndarray],
+    reference_cloud: np.ndarray,
+    distance: float,
+    smooth_sign_outliers: bool = False,
+) -> List[np.ndarray]:
+    if distance <= 0.0:
+        return [pts.copy() for pts in paths]
+
+    signs = [estimate_offset_sign_away_from_reference(pts, reference_cloud) for pts in paths]
+    if smooth_sign_outliers:
+        signs = smooth_isolated_sign_outliers(signs)
+
+    return [
+        offset_polyline_away_from_reference(pts, reference_cloud, distance, sign_override=sign)
+        for pts, sign in zip(paths, signs)
+    ]
+
+
+@dataclass
+class MaterialMask:
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+    scale: float
+    blocked: np.ndarray
+    material: np.ndarray
+    pixel_size: float
+    brush_radius_px: int
+
+    def point_to_rc(self, point: np.ndarray) -> Optional[Tuple[int, int]]:
+        col = int(round((float(point[0]) - self.xmin) * self.scale))
+        row = int(round((float(point[1]) - self.ymin) * self.scale))
+        if row < 0 or row >= self.blocked.shape[0] or col < 0 or col >= self.blocked.shape[1]:
+            return None
+        return row, col
+
+
+def sample_polyline_equal_arclength(path_pts: np.ndarray, n: int) -> np.ndarray:
+    pts = dedupe_consecutive_points(path_pts)
+    if len(pts) <= 1 or n <= 1:
+        return pts.copy()
+
+    s = cumulative_lengths(pts)
+    if s[-1] < 1e-12:
+        return np.repeat(pts[:1], n, axis=0)
+
+    u = np.linspace(0.0, s[-1], n)
+    x = np.interp(u, s, pts[:, 0])
+    y = np.interp(u, s, pts[:, 1])
+    return np.column_stack([x, y])
+
+
+def build_strip_midline_cloud(upper_edge: np.ndarray, lower_edge: np.ndarray, n: int = 500) -> np.ndarray:
+    upper = sample_polyline_equal_arclength(upper_edge, n)
+    lower = sample_polyline_equal_arclength(lower_edge, n)
+    count = min(len(upper), len(lower))
+    if count == 0:
+        return np.empty((0, 2), dtype=float)
+    return 0.5 * (upper[:count] + lower[:count])
+
+
+def _mark_disk(mask: np.ndarray, row: int, col: int, radius: int):
+    r0 = max(0, row - radius)
+    r1 = min(mask.shape[0] - 1, row + radius)
+    c0 = max(0, col - radius)
+    c1 = min(mask.shape[1] - 1, col + radius)
+    for rr in range(r0, r1 + 1):
+        for cc in range(c0, c1 + 1):
+            if (rr - row) ** 2 + (cc - col) ** 2 <= radius ** 2:
+                mask[rr, cc] = True
+
+
+def _draw_segment_on_mask(mask: np.ndarray, p0_rc: np.ndarray, p1_rc: np.ndarray, radius: int):
+    delta = p1_rc - p0_rc
+    steps = max(int(math.ceil(np.max(np.abs(delta)) * 2.0)), 1)
+    for t in np.linspace(0.0, 1.0, steps + 1):
+        rc = p0_rc + t * delta
+        _mark_disk(mask, int(round(rc[1])), int(round(rc[0])), radius)
+
+
+def build_material_mask(
+    boundary_paths: List[np.ndarray],
+    seed_paths: List[np.ndarray],
+    join_tolerance: float,
+    max_dim_px: int = 1600,
+    brush_radius_px: int = 2,
+) -> Optional[MaterialMask]:
+    clouds = [pts for pts in boundary_paths if len(pts) > 0]
+    if not clouds:
+        return None
+
+    stack = np.vstack(clouds)
+    xmin, ymin = stack.min(axis=0)
+    xmax, ymax = stack.max(axis=0)
+    dx = xmax - xmin
+    dy = ymax - ymin
+    pad = max(join_tolerance * 2.0, 0.05 * max(dx, dy, 1.0), 1.0)
+    xmin -= pad
+    ymin -= pad
+    xmax += pad
+    ymax += pad
+    width = max(xmax - xmin, 1.0)
+    height = max(ymax - ymin, 1.0)
+    scale = (max_dim_px - 1) / max(width, height)
+    cols = int(math.ceil(width * scale)) + 1
+    rows = int(math.ceil(height * scale)) + 1
+
+    blocked = np.zeros((rows, cols), dtype=bool)
+
+    def to_xy_rc(points: np.ndarray) -> np.ndarray:
+        x = (points[:, 0] - xmin) * scale
+        y = (points[:, 1] - ymin) * scale
+        return np.column_stack([x, y])
+
+    for pts in boundary_paths:
+        if len(pts) < 2:
+            continue
+        rc = to_xy_rc(dedupe_consecutive_points(pts))
+        for i in range(len(rc) - 1):
+            _draw_segment_on_mask(blocked, rc[i], rc[i + 1], brush_radius_px)
+
+    endpoints = []
+    for pts in boundary_paths:
+        if len(pts) < 2:
+            continue
+        closed = np.linalg.norm(pts[0] - pts[-1]) < max(join_tolerance, 1e-7)
+        if closed:
+            continue
+        endpoints.append(pts[0])
+        endpoints.append(pts[-1])
+
+    for i in range(len(endpoints)):
+        for j in range(i + 1, len(endpoints)):
+            if np.linalg.norm(endpoints[i] - endpoints[j]) <= join_tolerance:
+                rc = to_xy_rc(np.vstack([endpoints[i], endpoints[j]]))
+                _draw_segment_on_mask(blocked, rc[0], rc[1], brush_radius_px)
+
+    material = np.zeros_like(blocked, dtype=bool)
+    queue = deque()
+
+    def enqueue_seed(point: np.ndarray):
+        col = int(round((float(point[0]) - xmin) * scale))
+        row = int(round((float(point[1]) - ymin) * scale))
+        for radius in range(0, 5):
+            for rr in range(max(0, row - radius), min(rows - 1, row + radius) + 1):
+                for cc in range(max(0, col - radius), min(cols - 1, col + radius) + 1):
+                    if blocked[rr, cc] or material[rr, cc]:
+                        continue
+                    material[rr, cc] = True
+                    queue.append((rr, cc))
+                    return
+
+    for seed_path in seed_paths:
+        for point in seed_path:
+            enqueue_seed(point)
+
+    if not queue:
+        return None
+
+    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    while queue:
+        row, col = queue.popleft()
+        for dr, dc in neighbors:
+            rr = row + dr
+            cc = col + dc
+            if rr < 0 or rr >= rows or cc < 0 or cc >= cols:
+                continue
+            if blocked[rr, cc] or material[rr, cc]:
+                continue
+            material[rr, cc] = True
+            queue.append((rr, cc))
+
+    return MaterialMask(
+        xmin=xmin,
+        ymin=ymin,
+        xmax=xmax,
+        ymax=ymax,
+        scale=scale,
+        blocked=blocked,
+        material=material,
+        pixel_size=1.0 / scale,
+        brush_radius_px=brush_radius_px,
+    )
+
+
+def _probe_material_side(mask: MaterialMask, point: np.ndarray, normal: np.ndarray, base_probe: float) -> Optional[bool]:
+    for mul in (1.0, 2.0, 3.0):
+        probe_point = point + mul * base_probe * normal
+        rc = mask.point_to_rc(probe_point)
+        if rc is None:
+            continue
+        row, col = rc
+        if mask.blocked[row, col]:
+            continue
+        return bool(mask.material[row, col])
+    return None
+
+
+def estimate_offset_sign_from_material_mask(path_pts: np.ndarray, material_mask: MaterialMask) -> Optional[float]:
+    pts = sample_polyline_equal_arclength(path_pts, min(max(len(path_pts), 21), 61))
+    if len(pts) < 2:
+        return None
+
+    tangents = polyline_vertex_tangents(pts)
+    normals = np.column_stack([-tangents[:, 1], tangents[:, 0]])
+    base_probe = max(material_mask.pixel_size * (material_mask.brush_radius_px + 3), 0.15)
+
+    votes = []
+    for point, normal in zip(pts, normals):
+        if np.linalg.norm(normal) < 1e-12:
+            continue
+        left_is_material = _probe_material_side(material_mask, point, normal, base_probe)
+        right_is_material = _probe_material_side(material_mask, point, -normal, base_probe)
+        if left_is_material is None or right_is_material is None:
+            continue
+        if left_is_material == right_is_material:
+            continue
+        votes.append(-1.0 if left_is_material else 1.0)
+
+    if not votes:
+        return None
+
+    pos = sum(1 for vote in votes if vote > 0.0)
+    neg = sum(1 for vote in votes if vote < 0.0)
+    return 1.0 if pos > neg else -1.0
+
+
+def offset_paths_using_material_mask(
+    paths: List[np.ndarray],
+    material_mask: Optional[MaterialMask],
+    distance: float,
+    fallback_reference_cloud: Optional[np.ndarray] = None,
+    fallback_spatial_neighbor_count: int = 0,
+) -> List[np.ndarray]:
+    signs = []
+    used_fallback = False
+    for pts in paths:
+        sign = None if material_mask is None else estimate_offset_sign_from_material_mask(pts, material_mask)
+        if sign is None and fallback_reference_cloud is not None and len(fallback_reference_cloud) > 0:
+            sign = estimate_offset_sign_away_from_reference(pts, fallback_reference_cloud)
+            used_fallback = True
+        if sign is None:
+            sign = 1.0
+        signs.append(sign)
+
+    if used_fallback and fallback_spatial_neighbor_count > 0 and len(paths) > 1:
+        signs = smooth_signs_by_spatial_neighbors(paths, signs, fallback_spatial_neighbor_count)
+
+    out = []
+    for pts, sign in zip(paths, signs):
+        out.append(offset_polyline_away_from_reference(pts, np.empty((0, 2), dtype=float), distance, sign_override=sign))
+    return out
+
+
+def merge_connected_paths(paths: List[np.ndarray], join_tolerance: float) -> np.ndarray:
+    if not paths:
+        return np.empty((0, 2), dtype=float)
+
+    merged = dedupe_consecutive_points(paths[0])
+    for pts in paths[1:]:
+        next_pts = dedupe_consecutive_points(pts)
+        if len(merged) == 0:
+            merged = next_pts
+            continue
+        if len(next_pts) == 0:
+            continue
+
+        if np.linalg.norm(merged[-1] - next_pts[0]) <= join_tolerance:
+            joint = 0.5 * (merged[-1] + next_pts[0])
+            merged[-1] = joint
+            next_pts = next_pts.copy()
+            next_pts[0] = joint
+            merged = np.vstack([merged, next_pts[1:]])
+        else:
+            merged = np.vstack([merged, next_pts])
+
+    if len(merged) > 2 and np.linalg.norm(merged[0] - merged[-1]) <= join_tolerance:
+        merged[-1] = merged[0]
+
+    return dedupe_consecutive_points(merged)
+
+
+def effective_assignment_offset_signs(
+    paths: List[np.ndarray],
+    items: List[AssignmentItem],
+    material_mask: Optional[MaterialMask],
+    fallback_reference_cloud: Optional[np.ndarray] = None,
+    fallback_spatial_neighbor_count: int = 0,
+) -> List[float]:
+    signs = []
+    used_fallback = False
+    for pts in paths:
+        sign = None if material_mask is None else estimate_offset_sign_from_material_mask(pts, material_mask)
+        if sign is None and fallback_reference_cloud is not None and len(fallback_reference_cloud) > 0:
+            sign = estimate_offset_sign_away_from_reference(pts, fallback_reference_cloud)
+            used_fallback = True
+        if sign is None:
+            sign = 1.0
+        signs.append(sign)
+
+    if used_fallback and fallback_spatial_neighbor_count > 0 and len(paths) > 1:
+        signs = smooth_signs_by_spatial_neighbors(paths, signs, fallback_spatial_neighbor_count)
+
+    return [(-sign if item.kerf_flip else sign) for item, sign in zip(items, signs)]
+
+
+def smooth_signs_by_spatial_neighbors(paths: List[np.ndarray], signs: List[float], neighbor_count: int) -> List[float]:
+    if len(paths) <= 1 or neighbor_count <= 0:
+        return list(signs)
+
+    centers = np.array([pts.mean(axis=0) for pts in paths], dtype=float)
+    smoothed = list(signs)
+    for i, center in enumerate(centers):
+        distances = np.linalg.norm(centers - center, axis=1)
+        neighbor_indices = [j for j in np.argsort(distances) if j != i][:neighbor_count]
+        if not neighbor_indices:
+            continue
+        pos = sum(1 for j in neighbor_indices if signs[j] > 0.0)
+        neg = sum(1 for j in neighbor_indices if signs[j] < 0.0)
+        if pos == neg:
+            continue
+        smoothed[i] = 1.0 if pos > neg else -1.0
+
+    return smoothed
+
+
+def offset_assignment_items_using_material_mask(
+    entities,
+    items: List[AssignmentItem],
+    distance: float,
+    material_mask: Optional[MaterialMask],
+    fallback_reference_cloud: Optional[np.ndarray] = None,
+    fallback_spatial_neighbor_count: int = 0,
+    join_tolerance: float = 0.5,
+) -> List[np.ndarray]:
+    if distance <= 0.0:
+        return [sample_entity(entities, item.idx, reverse=item.reverse) for item in items]
+
+    paths = [sample_entity(entities, item.idx, reverse=item.reverse) for item in items]
+    final_signs = effective_assignment_offset_signs(
+        paths,
+        items,
+        material_mask,
+        fallback_reference_cloud=fallback_reference_cloud,
+        fallback_spatial_neighbor_count=fallback_spatial_neighbor_count,
+    )
+
+    stitched_runs: List[Tuple[np.ndarray, float]] = []
+    current_paths: List[np.ndarray] = []
+    current_sign: Optional[float] = None
+
+    for pts, final_sign in zip(paths, final_signs):
+        if not current_paths:
+            current_paths = [pts]
+            current_sign = final_sign
+            continue
+
+        prev_pts = current_paths[-1]
+        connected = np.linalg.norm(prev_pts[-1] - pts[0]) <= join_tolerance
+        if connected and current_sign == final_sign:
+            current_paths.append(pts)
+            continue
+
+        stitched_runs.append((merge_connected_paths(current_paths, join_tolerance), current_sign))
+        current_paths = [pts]
+        current_sign = final_sign
+
+    if current_paths and current_sign is not None:
+        stitched_runs.append((merge_connected_paths(current_paths, join_tolerance), current_sign))
+
+    out = []
+    for stitched_path, final_sign in stitched_runs:
+        out.append(
+            offset_polyline_away_from_reference(
+                stitched_path,
+                np.empty((0, 2), dtype=float),
+                distance,
+                sign_override=final_sign,
+            )
+        )
+    return out
+
+
+def compensated_circle_radius(item: AssignmentItem, radius: float, kerf_offset: float) -> float:
+    if kerf_offset <= 0.0:
+        return radius
+    delta = kerf_offset if item.kerf_flip else -kerf_offset
+    return max(radius + delta, 1e-6)
 
 
 # =========================
@@ -376,6 +1182,7 @@ class DXFSplitterGUI:
         self.root = root
         self.root.title("DXF Spiral Spring Splitter")
         self.root.geometry("1600x960")
+        self.root.minsize(1100, 720)
 
         self.project_root = PROJECT_ROOT
         self.default_dxf_dir = DEFAULT_DXF_DIR
@@ -388,8 +1195,11 @@ class DXFSplitterGUI:
         self.entities = []
         self.assignments: Dict[str, List[AssignmentItem]] = {k: [] for k in CATEGORIES}
         self.current_category = tk.StringVar(value="upper_edge")
+        self.category_help_var = tk.StringVar(value=CATEGORY_META["upper_edge"]["description"])
         self.n_sections_var = tk.IntVar(value=12)
         self.auto_gap_var = tk.DoubleVar(value=0.5)
+        self.kerf_mm_var = tk.DoubleVar(value=0.0)
+        self.show_kerf_overlay_var = tk.BooleanVar(value=False)
         self.show_labels_var = tk.BooleanVar(value=True)
         self.show_arrows_var = tk.BooleanVar(value=True)
         self.show_start_end_var = tk.BooleanVar(value=True)
@@ -397,23 +1207,49 @@ class DXFSplitterGUI:
         self.status_var = tk.StringVar(value="Load a DXF.")
 
         self.figure, self.ax = plt.subplots(figsize=(9, 9))
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self.root)
+        self.canvas: Optional[FigureCanvasTkAgg] = None
+        self.nav_toolbar: Optional[NavigationToolbar2Tk] = None
+        self._default_plot_limits: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
+        self.left_canvas: Optional[tk.Canvas] = None
+        self.left_inner: Optional[ttk.Frame] = None
+        self.left_scrollbar: Optional[ttk.Scrollbar] = None
+        self.left_window_id: Optional[int] = None
 
         self.entity_plot_handles = {}
         self.entity_label_handles = {}
 
         self._build_ui()
+        self.current_category.trace_add("write", self._update_category_help)
         self._bind_events()
 
     def _build_ui(self):
         main = ttk.Frame(self.root)
         main.pack(fill="both", expand=True)
 
-        left = ttk.Frame(main, width=400)
-        left.pack(side="left", fill="y", padx=6, pady=6)
+        left_shell = ttk.Frame(main, width=420)
+        left_shell.pack(side="left", fill="both", padx=6, pady=6)
+        left_shell.pack_propagate(False)
 
         right = ttk.Frame(main)
         right.pack(side="right", fill="both", expand=True, padx=6, pady=6)
+
+        self.left_canvas = tk.Canvas(left_shell, highlightthickness=0, borderwidth=0)
+        self.left_canvas.pack(side="left", fill="both", expand=True)
+
+        self.left_scrollbar = ttk.Scrollbar(left_shell, orient="vertical", command=self.left_canvas.yview)
+        self.left_scrollbar.pack(side="right", fill="y")
+        self.left_canvas.configure(yscrollcommand=self.left_scrollbar.set)
+
+        left = ttk.Frame(self.left_canvas)
+        self.left_inner = left
+        self.left_window_id = self.left_canvas.create_window((0, 0), window=left, anchor="nw")
+        left.bind("<Configure>", self._on_left_inner_configure)
+        self.left_canvas.bind("<Configure>", self._on_left_canvas_configure)
+        self.left_canvas.bind("<Enter>", self._bind_left_mousewheel)
+        self.left_canvas.bind("<Leave>", self._unbind_left_mousewheel)
+
+        plot_frame = ttk.Frame(right)
+        plot_frame.pack(fill="both", expand=True)
 
         file_frame = ttk.LabelFrame(left, text="File")
         file_frame.pack(fill="x", pady=4)
@@ -432,10 +1268,17 @@ class DXFSplitterGUI:
         for cat in CATEGORIES:
             ttk.Radiobutton(
                 mode_frame,
-                text=cat,
+                text=category_label(cat),
                 variable=self.current_category,
                 value=cat
             ).pack(anchor="w", padx=4, pady=2)
+
+        ttk.Label(
+            mode_frame,
+            textvariable=self.category_help_var,
+            wraplength=360,
+            justify="left",
+        ).pack(fill="x", padx=4, pady=4)
 
         auto_frame = ttk.LabelFrame(left, text="Auto-chain")
         auto_frame.pack(fill="x", pady=4)
@@ -472,8 +1315,46 @@ class DXFSplitterGUI:
 
         row = ttk.Frame(opt_frame)
         row.pack(fill="x", padx=4, pady=4)
-        ttk.Label(row, text="Number of sections").pack(side="left")
-        ttk.Entry(row, textvariable=self.n_sections_var, width=8).pack(side="right")
+        ttk.Label(row, text="Spring segments per edge").pack(side="left")
+        tk.Spinbox(row, from_=1, to=999, textvariable=self.n_sections_var, width=8).pack(side="right")
+
+        ttk.Label(
+            opt_frame,
+            text="Controls how many DXFs each spring edge is split into. Default: 12.",
+            wraplength=360,
+            justify="left",
+        ).pack(fill="x", padx=4, pady=(0, 4))
+
+        kerf_frame = ttk.LabelFrame(left, text="Kerf compensation")
+        kerf_frame.pack(fill="x", pady=4)
+
+        row = ttk.Frame(kerf_frame)
+        row.pack(fill="x", padx=4, pady=4)
+        ttk.Label(row, text="Manual kerf (mm)").pack(side="left")
+        tk.Spinbox(row, from_=0.0, to=5.0, increment=0.01, textvariable=self.kerf_mm_var, width=8).pack(side="right")
+
+        ttk.Checkbutton(
+            kerf_frame,
+            text="Show kerf overlay in plot",
+            variable=self.show_kerf_overlay_var,
+            command=self.redraw_plot,
+        ).pack(anchor="w", padx=4, pady=2)
+
+        ttk.Button(
+            kerf_frame,
+            text="Redraw kerf overlay",
+            command=self.redraw_plot,
+        ).pack(fill="x", padx=4, pady=4)
+
+        ttk.Label(
+            kerf_frame,
+            text=(
+                "When kerf is greater than 0, exports shift all generated DXFs by kerf/2 in the compensated "
+                "direction. Holes shrink, outer contours expand, and the inner-end geometry shifts toward the center opening."
+            ),
+            wraplength=360,
+            justify="left",
+        ).pack(fill="x", padx=4, pady=(0, 4))
 
         ttk.Checkbutton(
             opt_frame,
@@ -497,7 +1378,7 @@ class DXFSplitterGUI:
         ).pack(anchor="w", padx=4, pady=2)
 
         ttk.Button(opt_frame, text="Clear all assignments", command=self.clear_assignments).pack(fill="x", padx=4, pady=4)
-        ttk.Button(opt_frame, text="Redraw / auto-fit", command=self.redraw_plot).pack(fill="x", padx=4, pady=4)
+        ttk.Button(opt_frame, text="Redraw / auto-fit", command=lambda: self.redraw_plot(auto_fit=True)).pack(fill="x", padx=4, pady=4)
 
         edit_frame = ttk.LabelFrame(left, text="Assignments")
         edit_frame.pack(fill="both", expand=True, pady=4)
@@ -508,7 +1389,7 @@ class DXFSplitterGUI:
         self.listboxes = {}
         for cat in CATEGORIES:
             tab = ttk.Frame(self.category_tabs)
-            self.category_tabs.add(tab, text=cat)
+            self.category_tabs.add(tab, text=category_label(cat))
 
             lb = tk.Listbox(tab, exportselection=False, height=10)
             lb.pack(fill="both", expand=True, padx=4, pady=4)
@@ -517,6 +1398,7 @@ class DXFSplitterGUI:
             btn_row1 = ttk.Frame(tab)
             btn_row1.pack(fill="x", padx=4, pady=2)
             ttk.Button(btn_row1, text="Toggle Reverse", command=lambda c=cat: self.toggle_reverse(c)).pack(side="left", expand=True, fill="x", padx=2)
+            ttk.Button(btn_row1, text="Toggle Kerf Dir", command=lambda c=cat: self.toggle_kerf_direction(c)).pack(side="left", expand=True, fill="x", padx=2)
             ttk.Button(btn_row1, text="Remove", command=lambda c=cat: self.remove_selected_assignment(c)).pack(side="left", expand=True, fill="x", padx=2)
 
             btn_row2 = ttk.Frame(tab)
@@ -530,13 +1412,16 @@ class DXFSplitterGUI:
             inst,
             text=(
                 "Manual:\n"
-                "  1. Choose a category\n"
+                "  1. Choose a segment group\n"
                 "  2. Click entities in order\n"
-                "  3. Fix direction with Toggle Reverse\n\n"
+                "  3. Click an assigned entity again to remove a misclick\n"
+                "  4. Fix direction with Toggle Reverse if needed\n"
+                "  5. For fixture / transition / inner ring, use Toggle Kerf Dir if auto kerf is on the wrong side\n\n"
                 "Semi-automatic:\n"
                 "  1. Click one seed entity\n"
                 "  2. Press 'Seed with selected entity + auto-chain'\n"
-                "  3. Inspect and adjust"
+                "  3. Inspect and adjust\n\n"
+                "Use the toolbar below the plot for Home / Pan / Zoom."
             ),
             justify="left",
             wraplength=360,
@@ -549,7 +1434,9 @@ class DXFSplitterGUI:
             text=(
                 "Green dot = start\n"
                 "Red dot = end\n"
-                "Arrow = forward direction along the sampled path"
+                "Arrow = forward direction along the sampled path\n"
+                "Outer fixture includes circular holes\n"
+                "Dashed overlay = kerf-adjusted export path"
             ),
             justify="left",
             wraplength=360,
@@ -559,15 +1446,60 @@ class DXFSplitterGUI:
         status_frame.pack(fill="x", pady=4)
         ttk.Label(status_frame, textvariable=self.status_var, wraplength=360, justify="left").pack(fill="x", padx=4, pady=4)
 
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
         canvas_widget = self.canvas.get_tk_widget()
-        canvas_widget.pack(in_=right, fill="both", expand=True)
+        canvas_widget.pack(fill="both", expand=True)
 
         toolbar_row = ttk.Frame(right)
         toolbar_row.pack(fill="x")
-        ttk.Button(toolbar_row, text="Redraw", command=self.redraw_plot).pack(side="left", padx=4, pady=4)
+        self.nav_toolbar = NavigationToolbar2Tk(self.canvas, toolbar_row, pack_toolbar=False)
+        self.nav_toolbar.update()
+        self.nav_toolbar.pack(side="left", fill="x", expand=True)
+        ttk.Button(toolbar_row, text="Redraw / auto-fit", command=lambda: self.redraw_plot(auto_fit=True)).pack(side="right", padx=4, pady=4)
+
+    def _on_left_inner_configure(self, _event):
+        if self.left_canvas is None:
+            return
+        self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
+
+    def _on_left_canvas_configure(self, event):
+        if self.left_canvas is None or self.left_window_id is None:
+            return
+        self.left_canvas.itemconfigure(self.left_window_id, width=event.width)
+
+    def _bind_left_mousewheel(self, _event):
+        self.root.bind_all("<MouseWheel>", self._on_left_mousewheel)
+        self.root.bind_all("<Button-4>", self._on_left_mousewheel)
+        self.root.bind_all("<Button-5>", self._on_left_mousewheel)
+
+    def _unbind_left_mousewheel(self, _event):
+        self.root.unbind_all("<MouseWheel>")
+        self.root.unbind_all("<Button-4>")
+        self.root.unbind_all("<Button-5>")
+
+    def _on_left_mousewheel(self, event):
+        if self.left_canvas is None:
+            return
+        if getattr(event, "num", None) == 4:
+            step = -1
+        elif getattr(event, "num", None) == 5:
+            step = 1
+        elif getattr(event, "delta", 0):
+            step = -1 if event.delta > 0 else 1
+        else:
+            return
+        self.left_canvas.yview_scroll(step, "units")
 
     def _bind_events(self):
         self.canvas.mpl_connect("pick_event", self.on_pick)
+
+    def _update_category_help(self, *_args):
+        self.category_help_var.set(CATEGORY_META[self.current_category.get()]["description"])
+
+    def _capture_view_limits(self) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        if not self.entities:
+            return None
+        return (self.ax.get_xlim(), self.ax.get_ylim())
 
     def _ensure_workspace_dirs(self):
         self.default_dxf_dir.mkdir(parents=True, exist_ok=True)
@@ -616,13 +1548,145 @@ class DXFSplitterGUI:
         self.dxf_path = path.resolve()
         self.file_label.config(text=str(self.dxf_path))
 
+    def _split_outer_fixture_assignments(self) -> Tuple[List[AssignmentItem], List[Tuple[AssignmentItem, float, float, float]]]:
+        fixture_items = []
+        circles = []
+        for item in self.assignments["outer_fixture"]:
+            typ = self.entities[item.idx][0]
+            if typ == "CIRCLE":
+                d = pairdict(self.entities[item.idx][1])
+                circles.append((item, float(d["10"][0]), float(d["20"][0]), float(d["40"][0])))
+            else:
+                fixture_items.append(item)
+        return fixture_items, circles
+
+    def _current_kerf_mm(self) -> float:
+        kerf_mm = float(self.kerf_mm_var.get())
+        if kerf_mm < 0.0:
+            raise ValueError("Manual kerf must be >= 0.")
+        return kerf_mm
+
+    def _build_kerf_preview_geometry(self, kerf_mm: float) -> Optional[Dict[str, List]]:
+        if kerf_mm <= 0.0 or not self.entities:
+            return None
+
+        if not self.assignments["upper_edge"] or not self.assignments["lower_edge"]:
+            return None
+
+        try:
+            upper_edge = path_from_assignment_list(self.entities, self.assignments["upper_edge"])
+            lower_edge = path_from_assignment_list(self.entities, self.assignments["lower_edge"])
+        except Exception:
+            return None
+
+        offset = kerf_mm / 2.0
+        preview = {
+            "upper": [],
+            "lower": [],
+            "outer": [],
+            "circles": [],
+            "transition": [],
+            "inner": [],
+        }
+
+        outer_fixture_items, circle_items = self._split_outer_fixture_assignments()
+        outer_paths = [sample_entity(self.entities, item.idx, reverse=item.reverse) for item in outer_fixture_items]
+        transition_paths = [
+            sample_entity(self.entities, item.idx, reverse=item.reverse)
+            for item in self.assignments["inner_transition"]
+        ]
+        inner_paths = [
+            sample_entity(self.entities, item.idx, reverse=item.reverse)
+            for item in self.assignments["inner_cutout"]
+        ]
+
+        outer_cloud = geometry_points_from_assignments(self.entities, outer_fixture_items)
+        circle_cloud = geometry_points_from_circles([(cx, cy, r) for _item, cx, cy, r in circle_items])
+        if len(circle_cloud) > 0:
+            outer_cloud = np.vstack([outer_cloud, circle_cloud]) if len(outer_cloud) > 0 else circle_cloud
+        inner_cutout_cloud = geometry_points_from_assignments(self.entities, self.assignments["inner_cutout"])
+
+        inner_cloud = geometry_points_from_assignments(
+            self.entities,
+            self.assignments["inner_transition"] + self.assignments["inner_cutout"],
+        )
+        reference_clouds = [upper_edge, lower_edge]
+        if len(inner_cloud) > 0:
+            reference_clouds.append(inner_cloud)
+        outer_reference_cloud = np.vstack(reference_clouds)
+
+        circle_paths = []
+        for _item, cx, cy, r in circle_items:
+            th = np.linspace(0.0, 2.0 * math.pi, 240)
+            circle_paths.append(np.column_stack([cx + r * np.cos(th), cy + r * np.sin(th)]))
+
+        midline_cloud = build_strip_midline_cloud(upper_edge, lower_edge)
+        join_tolerance = max(float(self.auto_gap_var.get()), 0.5)
+        material_mask = build_material_mask(
+            [upper_edge, lower_edge] + outer_paths + transition_paths + inner_paths + circle_paths,
+            [midline_cloud],
+            join_tolerance=join_tolerance,
+        )
+
+        preview["upper"].extend(
+            offset_paths_using_material_mask([upper_edge], material_mask, offset, fallback_reference_cloud=lower_edge)
+        )
+        preview["lower"].extend(
+            offset_paths_using_material_mask([lower_edge], material_mask, offset, fallback_reference_cloud=upper_edge)
+        )
+        preview["outer"].extend(
+            offset_assignment_items_using_material_mask(
+                self.entities,
+                outer_fixture_items,
+                offset,
+                material_mask,
+                fallback_reference_cloud=midline_cloud,
+                fallback_spatial_neighbor_count=4,
+                join_tolerance=join_tolerance,
+            )
+        )
+
+        for item, cx, cy, r in circle_items:
+            preview["circles"].append((cx, cy, compensated_circle_radius(item, r, offset)))
+
+        inner_reference_clouds = [upper_edge, lower_edge]
+        if len(outer_cloud) > 0:
+            inner_reference_clouds.append(outer_cloud)
+        inner_reference_cloud = np.vstack(inner_reference_clouds)
+
+        preview["transition"].extend(
+            offset_assignment_items_using_material_mask(
+                self.entities,
+                self.assignments["inner_transition"],
+                offset,
+                material_mask,
+                fallback_reference_cloud=np.vstack([midline_cloud, inner_cutout_cloud]) if len(inner_cutout_cloud) > 0 else midline_cloud,
+                fallback_spatial_neighbor_count=2,
+                join_tolerance=join_tolerance,
+            )
+        )
+
+        preview["inner"].extend(
+            offset_assignment_items_using_material_mask(
+                self.entities,
+                self.assignments["inner_cutout"],
+                offset,
+                material_mask,
+                fallback_reference_cloud=inner_reference_cloud,
+                join_tolerance=join_tolerance,
+            )
+        )
+
+        return preview
+
     def refresh_assignment_lists(self):
         for cat, lb in self.listboxes.items():
             lb.delete(0, "end")
             for item in self.assignments[cat]:
                 typ = self.entities[item.idx][0] if self.entities else "?"
                 rev = "rev" if item.reverse else "fwd"
-                lb.insert("end", f"{item.idx:03d} | {typ:<6} | {rev}")
+                kerf = "kflip" if item.kerf_flip else "kauto"
+                lb.insert("end", f"{item.idx:03d} | {typ:<6} | {rev} | {kerf}")
 
     def clear_assignments(self):
         self.assignments = {k: [] for k in CATEGORIES}
@@ -644,9 +1708,17 @@ class DXFSplitterGUI:
             self._load_dxf_from_path(Path(path))
             self.config_path = None
             self.clear_assignments()
-            self.status_var.set(f"Loaded {len(self.entities)} entities.")
-            self.redraw_plot()
-            messagebox.showinfo("Loaded", f"Loaded {len(self.entities)} entities.")
+            drawable_count = sum(1 for typ, _ in self.entities if typ in DRAWABLE_TYPES)
+            self.status_var.set(
+                f"Loaded {len(self.entities)} entities ({drawable_count} drawable). "
+                "Use the right-hand plot to click entities."
+            )
+            self.redraw_plot(auto_fit=True)
+            messagebox.showinfo(
+                "Loaded",
+                f"Loaded {len(self.entities)} entities.\n"
+                f"Drawable in plot: {drawable_count}"
+            )
         except Exception as e:
             messagebox.showerror("Error loading DXF", str(e))
 
@@ -671,6 +1743,7 @@ class DXFSplitterGUI:
             "source_dxf_rel": self._relative_to_project(self.dxf_path),
             "n_sections": int(self.n_sections_var.get()),
             "auto_gap": float(self.auto_gap_var.get()),
+            "kerf_mm": float(self.kerf_mm_var.get()),
             "assignments": {
                 cat: [item.to_json() for item in items]
                 for cat, items in self.assignments.items()
@@ -707,26 +1780,33 @@ class DXFSplitterGUI:
 
             self.n_sections_var.set(int(obj.get("n_sections", 12)))
             self.auto_gap_var.set(float(obj.get("auto_gap", 0.5)))
-            loaded = {}
+            self.kerf_mm_var.set(float(obj.get("kerf_mm", 0.0)))
+            raw_assignments = obj.get("assignments", {})
+            loaded = {cat: [] for cat in CATEGORIES}
             for cat in CATEGORIES:
-                loaded[cat] = [AssignmentItem.from_json(x) for x in obj.get("assignments", {}).get(cat, [])]
+                loaded[cat] = [AssignmentItem.from_json(x) for x in raw_assignments.get(cat, [])]
+            loaded["outer_fixture"].extend(
+                AssignmentItem.from_json(x) for x in raw_assignments.get("hole_circles", [])
+            )
             self.assignments = loaded
 
             self.refresh_assignment_lists()
-            self.redraw_plot()
+            self.redraw_plot(auto_fit=True)
             self.status_var.set(f"Loaded config from {path}")
             messagebox.showinfo("Loaded", f"Loaded config from:\n{path}")
         except Exception as e:
             messagebox.showerror("Error loading config", str(e))
 
-    def redraw_plot(self):
+    def redraw_plot(self, auto_fit: bool = False):
+        previous_limits = None if auto_fit else self._capture_view_limits()
         self.ax.clear()
         self.entity_plot_handles.clear()
         self.entity_label_handles.clear()
+        self._default_plot_limits = None
 
         if not self.entities:
             self.ax.set_title("Load a DXF")
-            self.canvas.draw_idle()
+            self.canvas.draw()
             return
 
         assigned_lookup = {}
@@ -740,7 +1820,6 @@ class DXFSplitterGUI:
             "outer_fixture": "tab:green",
             "inner_transition": "tab:red",
             "inner_cutout": "tab:purple",
-            "hole_circles": "tab:brown",
         }
 
         all_pts = []
@@ -793,7 +1872,7 @@ class DXFSplitterGUI:
                 )
                 self.entity_label_handles[idx] = txt
 
-            arrow_data = local_direction_arrow_points(pts)
+            arrow_data = None if typ == "CIRCLE" else local_direction_arrow_points(pts)
             if arrow_data is not None:
                 start, start_dir, end, end_dir = arrow_data
                 xy_scale = max(np.ptp(pts[:, 0]), np.ptp(pts[:, 1]), 1.0)
@@ -833,13 +1912,58 @@ class DXFSplitterGUI:
             dx = xmax - xmin
             dy = ymax - ymin
             pad = 0.05 * max(dx, dy, 1.0)
-            self.ax.set_xlim(xmin - pad, xmax + pad)
-            self.ax.set_ylim(ymin - pad, ymax + pad)
+            self._default_plot_limits = (
+                (xmin - pad, xmax + pad),
+                (ymin - pad, ymax + pad),
+            )
+
+        kerf_overlay_active = False
+        kerf_mm = 0.0
+        if self.show_kerf_overlay_var.get():
+            try:
+                kerf_mm = self._current_kerf_mm()
+                preview = self._build_kerf_preview_geometry(kerf_mm)
+            except Exception:
+                preview = None
+            if preview is not None:
+                overlay_style = dict(
+                    linestyle=(0, (5, 3)),
+                    linewidth=1.6,
+                    alpha=0.95,
+                    zorder=9,
+                )
+                for pts in preview["upper"]:
+                    self.ax.plot(pts[:, 0], pts[:, 1], color="navy", **overlay_style)
+                for pts in preview["lower"]:
+                    self.ax.plot(pts[:, 0], pts[:, 1], color="saddlebrown", **overlay_style)
+                for pts in preview["outer"]:
+                    self.ax.plot(pts[:, 0], pts[:, 1], color="darkgreen", **overlay_style)
+                for cx, cy, r in preview["circles"]:
+                    th = np.linspace(0.0, 2.0 * math.pi, 240)
+                    self.ax.plot(cx + r * np.cos(th), cy + r * np.sin(th), color="darkgreen", **overlay_style)
+                for pts in preview["transition"]:
+                    self.ax.plot(pts[:, 0], pts[:, 1], color="darkred", **overlay_style)
+                for pts in preview["inner"]:
+                    self.ax.plot(pts[:, 0], pts[:, 1], color="indigo", **overlay_style)
+                kerf_overlay_active = True
+
+        if auto_fit or previous_limits is None:
+            if self._default_plot_limits is not None:
+                xlim, ylim = self._default_plot_limits
+                self.ax.set_xlim(*xlim)
+                self.ax.set_ylim(*ylim)
+        else:
+            xlim, ylim = previous_limits
+            self.ax.set_xlim(*xlim)
+            self.ax.set_ylim(*ylim)
 
         self.ax.set_aspect("equal", adjustable="box")
-        self.ax.set_title("Click entities to assign them")
+        title = "Click entities to assign them"
+        if kerf_overlay_active:
+            title += f" | dashed overlay = exported kerf-adjusted paths ({kerf_mm:.3f} mm kerf)"
+        self.ax.set_title(title)
         self.ax.grid(True, alpha=0.3)
-        self.canvas.draw_idle()
+        self.canvas.draw()
 
     def on_pick(self, event):
         artist = event.artist
@@ -849,9 +1973,19 @@ class DXFSplitterGUI:
 
         self.selected_entity_idx = idx
         cat = self.current_category.get()
+        typ = self.entities[idx][0]
 
-        if cat == "hole_circles" and self.entities[idx][0] != "CIRCLE":
-            self.status_var.set(f"Selected entity {idx}, but it is not a CIRCLE.")
+        if typ not in CATEGORY_ALLOWED_TYPES[cat]:
+            self.status_var.set(
+                f"Entity {idx} has type {typ}, which does not belong in {category_label(cat)}."
+            )
+            self.redraw_plot()
+            return
+
+        if idx in [item.idx for item in self.assignments[cat]]:
+            self.assignments[cat] = [item for item in self.assignments[cat] if item.idx != idx]
+            self.refresh_assignment_lists()
+            self.status_var.set(f"Removed entity {idx} from {category_label(cat)}.")
             self.redraw_plot()
             return
 
@@ -862,8 +1996,8 @@ class DXFSplitterGUI:
                 if idx in [item.idx for item in items]:
                     if not messagebox.askyesno(
                         "Entity already assigned",
-                        f"Entity {idx} is already assigned to '{other_cat}'.\n"
-                        f"Also add it to '{cat}'?"
+                        f"Entity {idx} is already assigned to '{category_label(other_cat)}'.\n"
+                        f"Also add it to '{category_label(cat)}'?"
                     ):
                         self.status_var.set(f"Selected entity {idx}.")
                         self.redraw_plot()
@@ -871,7 +2005,7 @@ class DXFSplitterGUI:
 
             self.assignments[cat].append(AssignmentItem(idx=idx, reverse=False))
             self.refresh_assignment_lists()
-            self.status_var.set(f"Added entity {idx} to {cat}.")
+            self.status_var.set(f"Added entity {idx} to {category_label(cat)}.")
         else:
             self.status_var.set(f"Selected entity {idx}.")
 
@@ -886,7 +2020,29 @@ class DXFSplitterGUI:
         self.assignments[cat][i].reverse = not self.assignments[cat][i].reverse
         self.refresh_assignment_lists()
         lb.selection_set(i)
-        self.status_var.set(f"Toggled reverse for entity {self.assignments[cat][i].idx} in {cat}.")
+        self.status_var.set(f"Toggled reverse for entity {self.assignments[cat][i].idx} in {category_label(cat)}.")
+        self.redraw_plot()
+
+    def toggle_kerf_direction(self, cat: str):
+        if cat not in MANUAL_KERF_CATEGORIES:
+            messagebox.showwarning(
+                "Not supported",
+                f"Manual kerf direction overrides are only supported for {category_label('outer_fixture')}, "
+                f"{category_label('inner_transition')}, and {category_label('inner_cutout')}."
+            )
+            return
+
+        lb = self.listboxes[cat]
+        sel = lb.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        item = self.assignments[cat][i]
+        item.kerf_flip = not item.kerf_flip
+        self.refresh_assignment_lists()
+        lb.selection_set(i)
+        state = "flipped" if item.kerf_flip else "automatic"
+        self.status_var.set(f"Kerf direction for entity {item.idx} in {category_label(cat)} is now {state}.")
         self.redraw_plot()
 
     def remove_selected_assignment(self, cat: str):
@@ -898,7 +2054,7 @@ class DXFSplitterGUI:
         removed = self.assignments[cat][i]
         del self.assignments[cat][i]
         self.refresh_assignment_lists()
-        self.status_var.set(f"Removed entity {removed.idx} from {cat}.")
+        self.status_var.set(f"Removed entity {removed.idx} from {category_label(cat)}.")
         self.redraw_plot()
 
     def move_assignment(self, cat: str, delta: int):
@@ -913,13 +2069,10 @@ class DXFSplitterGUI:
         self.assignments[cat][i], self.assignments[cat][j] = self.assignments[cat][j], self.assignments[cat][i]
         self.refresh_assignment_lists()
         lb.selection_set(j)
-        self.status_var.set(f"Moved entity in {cat}.")
+        self.status_var.set(f"Moved entity in {category_label(cat)}.")
         self.redraw_plot()
 
     def _candidate_indices_for_category(self, cat: str) -> List[int]:
-        if cat == "hole_circles":
-            return [i for i, (typ, _) in enumerate(self.entities) if typ == "CIRCLE"]
-
         other_assigned = set()
         for other_cat, items in self.assignments.items():
             if other_cat == cat:
@@ -938,7 +2091,7 @@ class DXFSplitterGUI:
     def auto_chain_current_category(self):
         cat = self.current_category.get()
         if cat not in CHAINABLE_CATEGORIES:
-            messagebox.showwarning("Not chainable", f"Category '{cat}' is not auto-chainable.")
+            messagebox.showwarning("Not chainable", f"{category_label(cat)} is not auto-chainable.")
             return
 
         if not self.entities:
@@ -946,10 +2099,12 @@ class DXFSplitterGUI:
             return
 
         seed = self.assignments[cat]
-        if len(seed) == 0:
+        chain_seed = [item for item in seed if self.entities[item.idx][0] in CHAINABLE_TYPES]
+        static_items = [item for item in seed if self.entities[item.idx][0] not in CHAINABLE_TYPES]
+        if len(chain_seed) == 0:
             messagebox.showwarning(
                 "Need a seed",
-                "Add at least one seed entity to this category,\n"
+                "Add at least one line/arc/spline seed entity to this category,\n"
                 "or use 'Seed with selected entity + auto-chain'."
             )
             return
@@ -957,13 +2112,13 @@ class DXFSplitterGUI:
         try:
             max_gap = float(self.auto_gap_var.get())
             candidates = self._candidate_indices_for_category(cat)
-            chain, log = greedy_autochain(self.entities, seed, candidates, max_gap)
+            chain, log = greedy_autochain(self.entities, chain_seed, candidates, max_gap)
             old_n = len(self.assignments[cat])
-            self.assignments[cat] = chain
+            self.assignments[cat] = chain + static_items
             self.refresh_assignment_lists()
             self.redraw_plot()
             self.status_var.set(
-                f"Auto-chain finished for {cat}: added {len(chain) - old_n} entities "
+                f"Auto-chain finished for {category_label(cat)}: added {len(self.assignments[cat]) - old_n} entities "
                 f"with max gap {max_gap}."
             )
             if log:
@@ -974,7 +2129,7 @@ class DXFSplitterGUI:
     def seed_and_auto_chain_current_category(self):
         cat = self.current_category.get()
         if cat not in CHAINABLE_CATEGORIES:
-            messagebox.showwarning("Not chainable", f"Category '{cat}' is not auto-chainable.")
+            messagebox.showwarning("Not chainable", f"{category_label(cat)} is not auto-chainable.")
             return
 
         if self.selected_entity_idx is None:
@@ -998,11 +2153,13 @@ class DXFSplitterGUI:
     def validate_assignments(self):
         for cat in ["upper_edge", "lower_edge"]:
             if len(self.assignments[cat]) == 0:
-                raise ValueError(f"Category '{cat}' must contain at least one entity.")
+                raise ValueError(f"{category_label(cat)} must contain at least one entity.")
 
         n_sections = int(self.n_sections_var.get())
         if n_sections < 1:
-            raise ValueError("Number of sections must be >= 1.")
+            raise ValueError("Number of spring segments per edge must be >= 1.")
+
+        self._current_kerf_mm()
 
     def generate_outputs(self):
         if self.dxf_path is None or not self.entities:
@@ -1024,6 +2181,8 @@ class DXFSplitterGUI:
             out_dir = Path(out_dir).resolve()
 
             n_sections = int(self.n_sections_var.get())
+            kerf_mm = self._current_kerf_mm()
+            kerf_offset = kerf_mm / 2.0
 
             upper_edge = path_from_assignment_list(self.entities, self.assignments["upper_edge"])
             lower_edge = path_from_assignment_list(self.entities, self.assignments["lower_edge"])
@@ -1032,89 +2191,230 @@ class DXFSplitterGUI:
             upper_frags = [slice_polyline_by_fraction(upper_edge, u[i], u[i + 1]) for i in range(n_sections)]
             lower_frags = [slice_polyline_by_fraction(lower_edge, u[i], u[i + 1]) for i in range(n_sections)]
 
-            section_dir = out_dir / "spiral_open_section_paths"
-            section_dir.mkdir(parents=True, exist_ok=True)
+            output_dir = out_dir / "laser_stitching_dxfs"
+            output_dir.mkdir(parents=True, exist_ok=True)
 
-            manifest_lines = []
-            section_paths = []
+            manifest_lines = [
+                f"Segment numbering: 1 = arbor end, {n_sections} = outer fixture end.",
+                "Placement CSV values are absolute bottom-left positions in mm after shifting the full assembled spring so its overall bottom-left sits at X=0, Y=0.",
+            ]
+            if kerf_mm > 0.0:
+                manifest_lines.append(
+                    "Manual kerf compensation: "
+                    f"{kerf_mm:.3f} mm total kerf ({kerf_offset:.3f} mm offset). "
+                    "Applied to all exported geometry."
+                )
+            output_paths = []
+            export_records = []
 
-            circles = []
-            for item in self.assignments["hole_circles"]:
-                d = pairdict(self.entities[item.idx][1])
-                circles.append((float(d["10"][0]), float(d["20"][0]), float(d["40"][0])))
+            outer_fixture_items, circle_items = self._split_outer_fixture_assignments()
+            transition_items = self.assignments["inner_transition"]
+            inner_ring_items = self.assignments["inner_cutout"]
+            outer_paths = [sample_entity(self.entities, item.idx, reverse=item.reverse) for item in outer_fixture_items]
+            transition_paths = [sample_entity(self.entities, item.idx, reverse=item.reverse) for item in transition_items]
+            inner_ring_paths = [sample_entity(self.entities, item.idx, reverse=item.reverse) for item in inner_ring_items]
 
-            for i in range(n_sections):
-                p = section_dir / f"spiral_open_section_{i+1:02d}.dxf"
-                content = dxf_header()
+            outer_cloud = geometry_points_from_assignments(self.entities, outer_fixture_items)
+            circle_cloud = geometry_points_from_circles([(cx, cy, r) for _item, cx, cy, r in circle_items])
+            if len(circle_cloud) > 0:
+                outer_cloud = (
+                    np.vstack([outer_cloud, circle_cloud])
+                    if len(outer_cloud) > 0 else circle_cloud
+                )
+            inner_cutout_cloud = geometry_points_from_assignments(self.entities, inner_ring_items)
 
-                content += lwpolyline_entity(upper_frags[i], "SPRING_UPPER")
-                content += lwpolyline_entity(lower_frags[i], "SPRING_LOWER")
+            inner_cloud = geometry_points_from_assignments(
+                self.entities,
+                transition_items + inner_ring_items,
+            )
 
-                if i == 0:
-                    for item in self.assignments["outer_fixture"]:
-                        content += lwpolyline_entity(
-                            sample_entity(self.entities, item.idx, reverse=item.reverse),
-                            "OUTER_FIXTURE"
-                        )
-                    for cx, cy, r in circles:
-                        content += circle_entity(cx, cy, r, "OUTER_FIXTURE_HOLES")
+            upper_inner_to_outer = path_runs_inner_to_outer(upper_edge, inner_cloud, outer_cloud)
+            lower_inner_to_outer = path_runs_inner_to_outer(lower_edge, inner_cloud, outer_cloud)
 
-                if i == n_sections - 1:
-                    for item in self.assignments["inner_transition"]:
-                        content += lwpolyline_entity(
-                            sample_entity(self.entities, item.idx, reverse=item.reverse),
-                            "INNER_TRANSITION"
-                        )
-                    for item in self.assignments["inner_cutout"]:
-                        content += lwpolyline_entity(
-                            sample_entity(self.entities, item.idx, reverse=item.reverse),
-                            "INNER_CUTOUT"
-                        )
+            ordered_upper_frags = upper_frags if upper_inner_to_outer else list(reversed(upper_frags))
+            ordered_lower_frags = lower_frags if lower_inner_to_outer else list(reversed(lower_frags))
+            export_upper_frags = ordered_upper_frags
+            export_lower_frags = ordered_lower_frags
 
-                content += dxf_footer()
-                p.write_text(content)
-                section_paths.append(p)
+            circle_paths = []
+            for _item, cx, cy, r in circle_items:
+                th = np.linspace(0.0, 2.0 * math.pi, 240)
+                circle_paths.append(np.column_stack([cx + r * np.cos(th), cy + r * np.sin(th)]))
 
-                parts = [
-                    f"Section {i+1:02d}: upper length = {cumulative_lengths(upper_frags[i])[-1]:.3f}",
-                    f"lower length = {cumulative_lengths(lower_frags[i])[-1]:.3f}",
+            midline_cloud = build_strip_midline_cloud(upper_edge, lower_edge)
+            join_tolerance = max(float(self.auto_gap_var.get()), 0.5)
+            material_mask = build_material_mask(
+                [upper_edge, lower_edge] + outer_paths + transition_paths + inner_ring_paths + circle_paths,
+                [midline_cloud],
+                join_tolerance=join_tolerance,
+            )
+
+            if kerf_mm > 0.0:
+                export_upper_frags = offset_paths_using_material_mask(
+                    export_upper_frags,
+                    material_mask,
+                    kerf_offset,
+                    fallback_reference_cloud=lower_edge,
+                )
+                export_lower_frags = offset_paths_using_material_mask(
+                    export_lower_frags,
+                    material_mask,
+                    kerf_offset,
+                    fallback_reference_cloud=upper_edge,
+                )
+
+            if len(inner_cloud) == 0 or len(outer_cloud) == 0:
+                manifest_lines.append(
+                    "Note: segment numbering was inferred with incomplete inner/outer anchor geometry; verify numbering."
+                )
+
+            for seg_num, pts in enumerate(export_upper_frags, start=1):
+                p = output_dir / f"upper_segment_{seg_num}.dxf"
+                export_records.append({
+                    "path": p,
+                    "polylines": [(pts, "UPPER_SEGMENT")],
+                    "circles": [],
+                    "description": f"upper spring edge, length = {cumulative_lengths(pts)[-1]:.3f}",
+                })
+
+            for seg_num, pts in enumerate(export_lower_frags, start=1):
+                p = output_dir / f"lower_segment_{seg_num}.dxf"
+                export_records.append({
+                    "path": p,
+                    "polylines": [(pts, "LOWER_SEGMENT")],
+                    "circles": [],
+                    "description": f"lower spring edge, length = {cumulative_lengths(pts)[-1]:.3f}",
+                })
+
+            if outer_fixture_items or circle_items:
+                outer_polylines = [
+                    (pts, "OUTER_FIXTURE")
+                    for pts in outer_paths
                 ]
-                if i == 0 and (self.assignments["outer_fixture"] or circles):
-                    parts.append("includes OUTER_FIXTURE / holes")
-                if i == n_sections - 1 and (self.assignments["inner_transition"] or self.assignments["inner_cutout"]):
-                    parts.append("includes INNER_TRANSITION / INNER_CUTOUT")
-                manifest_lines.append(", ".join(parts))
+                outer_reference_clouds = [upper_edge, lower_edge]
+                if len(inner_cloud) > 0:
+                    outer_reference_clouds.append(inner_cloud)
+                outer_reference_cloud = np.vstack(outer_reference_clouds)
+                if kerf_mm > 0.0:
+                    compensated_outer_paths = offset_assignment_items_using_material_mask(
+                        self.entities,
+                        outer_fixture_items,
+                        kerf_offset,
+                        material_mask,
+                        fallback_reference_cloud=midline_cloud,
+                        fallback_spatial_neighbor_count=4,
+                        join_tolerance=join_tolerance,
+                    )
+                    outer_polylines = [
+                        (pts, "OUTER_FIXTURE")
+                        for pts in compensated_outer_paths
+                    ]
+                    outer_circles = [
+                        (cx, cy, compensated_circle_radius(item, r, kerf_offset), "OUTER_FIXTURE_HOLES")
+                        for item, cx, cy, r in circle_items
+                    ]
+                else:
+                    outer_circles = [(cx, cy, r, "OUTER_FIXTURE_HOLES") for _item, cx, cy, r in circle_items]
+                export_records.append({
+                    "path": output_dir / "outer_fixture_and_holes.dxf",
+                    "polylines": outer_polylines,
+                    "circles": outer_circles,
+                    "description": "complete outer fixture geometry including holes",
+                })
+            else:
+                manifest_lines.append("outer_fixture_and_holes.dxf: not generated (no outer fixture assigned)")
 
-            outer_file = None
-            if self.assignments["outer_fixture"] or circles:
-                outer_file = section_dir / "outer_fixture_with_holes_only.dxf"
-                content = dxf_header()
-                for item in self.assignments["outer_fixture"]:
-                    content += lwpolyline_entity(
-                        sample_entity(self.entities, item.idx, reverse=item.reverse),
-                        "OUTER_FIXTURE"
+            if transition_items or inner_ring_items:
+                transition_polylines = [
+                    (pts, "TRANSITION_REGION")
+                    for pts in transition_paths
+                ]
+                inner_ring_polylines = [
+                    (pts, "SPLINED_INNER_RING")
+                    for pts in inner_ring_paths
+                ]
+                inner_end_polylines = transition_polylines + inner_ring_polylines
+                inner_reference_clouds = [upper_edge, lower_edge]
+                if len(outer_cloud) > 0:
+                    inner_reference_clouds.append(outer_cloud)
+                inner_reference_cloud = np.vstack(inner_reference_clouds)
+                if kerf_mm > 0.0:
+                    compensated_transition_paths = offset_assignment_items_using_material_mask(
+                        self.entities,
+                        transition_items,
+                        kerf_offset,
+                        material_mask,
+                        fallback_reference_cloud=np.vstack([midline_cloud, inner_cutout_cloud]) if len(inner_cutout_cloud) > 0 else midline_cloud,
+                        fallback_spatial_neighbor_count=2,
+                        join_tolerance=join_tolerance,
                     )
-                for cx, cy, r in circles:
-                    content += circle_entity(cx, cy, r, "OUTER_FIXTURE_HOLES")
-                content += dxf_footer()
-                outer_file.write_text(content)
+                    compensated_inner_ring_paths = offset_assignment_items_using_material_mask(
+                        self.entities,
+                        inner_ring_items,
+                        kerf_offset,
+                        material_mask,
+                        fallback_reference_cloud=inner_reference_cloud,
+                        join_tolerance=join_tolerance,
+                    )
+                    inner_end_polylines = (
+                        [(pts, "TRANSITION_REGION") for pts in compensated_transition_paths]
+                        + [(pts, "SPLINED_INNER_RING") for pts in compensated_inner_ring_paths]
+                    )
+                export_records.append({
+                    "path": output_dir / "splined_inner_ring_and_transition_region.dxf",
+                    "polylines": inner_end_polylines,
+                    "circles": [],
+                    "description": "complete transition region and splined inner ring",
+                })
+            else:
+                manifest_lines.append(
+                    "splined_inner_ring_and_transition_region.dxf: not generated "
+                    "(no transition region or inner ring assigned)"
+                )
 
-            inner_file = None
-            if self.assignments["inner_transition"] or self.assignments["inner_cutout"]:
-                inner_file = section_dir / "inner_transition_and_cutout_only.dxf"
-                content = dxf_header()
-                for item in self.assignments["inner_transition"]:
-                    content += lwpolyline_entity(
-                        sample_entity(self.entities, item.idx, reverse=item.reverse),
-                        "INNER_TRANSITION"
+            global_bbox = union_bbox([
+                bbox_from_export_geometry(record["polylines"], record["circles"])
+                for record in export_records
+            ])
+            if global_bbox is None:
+                raise ValueError("No exportable geometry was generated.")
+
+            positions_csv_path = out_dir / "laser_stitching_positions.csv"
+            with positions_csv_path.open("w", newline="") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow([
+                    "file_name",
+                    "bottom_left_x_mm",
+                    "bottom_left_y_mm",
+                    "width_mm",
+                    "height_mm",
+                    "description",
+                ])
+
+                for record in export_records:
+                    bbox = bbox_from_export_geometry(record["polylines"], record["circles"])
+                    if bbox is None:
+                        continue
+
+                    xmin, ymin, xmax, ymax = bbox
+                    place_x = xmin - global_bbox[0]
+                    place_y = ymin - global_bbox[1]
+                    width = xmax - xmin
+                    height = ymax - ymin
+
+                    record["path"].write_text(build_dxf_content(record["polylines"], record["circles"]))
+                    output_paths.append(record["path"])
+                    manifest_lines.append(
+                        f"{record['path'].name}: {record['description']}, placement = ({place_x:.3f}, {place_y:.3f}) mm"
                     )
-                for item in self.assignments["inner_cutout"]:
-                    content += lwpolyline_entity(
-                        sample_entity(self.entities, item.idx, reverse=item.reverse),
-                        "INNER_CUTOUT"
-                    )
-                content += dxf_footer()
-                inner_file.write_text(content)
+                    writer.writerow([
+                        record["path"].name,
+                        f"{place_x:.3f}",
+                        f"{place_y:.3f}",
+                        f"{width:.3f}",
+                        f"{height:.3f}",
+                        record["description"],
+                    ])
 
             config_path = out_dir / "splitter_config.json"
             config_obj = {
@@ -1122,6 +2422,7 @@ class DXFSplitterGUI:
                 "source_dxf_rel": self._relative_to_project(self.dxf_path),
                 "n_sections": n_sections,
                 "auto_gap": float(self.auto_gap_var.get()),
+                "kerf_mm": kerf_mm,
                 "assignments": {
                     cat: [item.to_json() for item in items]
                     for cat, items in self.assignments.items()
@@ -1129,46 +2430,46 @@ class DXFSplitterGUI:
             }
             config_path.write_text(json.dumps(config_obj, indent=2))
 
-            manifest_path = out_dir / "spiral_open_section_paths_manifest.txt"
+            manifest_path = out_dir / "laser_stitching_manifest.txt"
             manifest_path.write_text("\n".join(manifest_lines) + "\n")
 
             fig, ax = plt.subplots(figsize=(9, 9))
-            for i in range(n_sections):
-                ax.plot(upper_frags[i][:, 0], upper_frags[i][:, 1], linewidth=1.5)
-                ax.plot(lower_frags[i][:, 0], lower_frags[i][:, 1], linewidth=1.5)
+            for seg_num, pts in enumerate(export_upper_frags, start=1):
+                ax.plot(pts[:, 0], pts[:, 1], linewidth=1.5, color="tab:blue")
+                mid = pts[len(pts) // 2]
+                ax.text(mid[0], mid[1], f"U{seg_num}", color="tab:blue", fontsize=7)
 
-            for item in self.assignments["outer_fixture"]:
-                pts = sample_entity(self.entities, item.idx, reverse=item.reverse)
-                ax.plot(pts[:, 0], pts[:, 1], linewidth=2.0)
+            for seg_num, pts in enumerate(export_lower_frags, start=1):
+                ax.plot(pts[:, 0], pts[:, 1], linewidth=1.5, color="tab:orange")
+                mid = pts[len(pts) // 2]
+                ax.text(mid[0], mid[1], f"L{seg_num}", color="tab:orange", fontsize=7)
 
-            for cx, cy, r in circles:
+            for pts, _layer in outer_polylines if outer_fixture_items or circle_items else []:
+                ax.plot(pts[:, 0], pts[:, 1], linewidth=2.0, color="tab:green")
+
+            for cx, cy, r, _layer in outer_circles if outer_fixture_items or circle_items else []:
                 th = np.linspace(0.0, 2.0 * math.pi, 240)
-                ax.plot(cx + r * np.cos(th), cy + r * np.sin(th), linewidth=2.0)
+                ax.plot(cx + r * np.cos(th), cy + r * np.sin(th), linewidth=2.0, color="tab:green")
 
-            for item in self.assignments["inner_transition"]:
-                pts = sample_entity(self.entities, item.idx, reverse=item.reverse)
-                ax.plot(pts[:, 0], pts[:, 1], linewidth=1.8)
-
-            for item in self.assignments["inner_cutout"]:
-                pts = sample_entity(self.entities, item.idx, reverse=item.reverse)
-                ax.plot(pts[:, 0], pts[:, 1], linewidth=1.6)
+            for pts, layer in inner_end_polylines if transition_items or inner_ring_items else []:
+                if layer == "TRANSITION_REGION":
+                    ax.plot(pts[:, 0], pts[:, 1], linewidth=1.8, color="tab:red")
+                else:
+                    ax.plot(pts[:, 0], pts[:, 1], linewidth=1.6, color="tab:purple")
 
             ax.set_aspect("equal", adjustable="box")
-            ax.set_title("Spiral Spring Section Paths Preview")
+            ax.set_title("Laser Stitching DXF Preview")
             ax.grid(True, alpha=0.3)
-            preview_path = out_dir / "spiral_open_section_paths_preview.png"
+            preview_path = out_dir / "laser_stitching_preview.png"
             fig.savefig(preview_path, dpi=220, bbox_inches="tight")
             plt.close(fig)
 
-            zip_path = out_dir / "spiral_open_section_paths.zip"
+            zip_path = out_dir / "laser_stitching_dxfs.zip"
             with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for p in section_paths:
+                for p in output_paths:
                     zf.write(p, arcname=p.relative_to(out_dir).as_posix())
-                if outer_file is not None:
-                    zf.write(outer_file, arcname=outer_file.relative_to(out_dir).as_posix())
-                if inner_file is not None:
-                    zf.write(inner_file, arcname=inner_file.relative_to(out_dir).as_posix())
                 zf.write(config_path, arcname=config_path.name)
+                zf.write(positions_csv_path, arcname=positions_csv_path.name)
                 zf.write(manifest_path, arcname=manifest_path.name)
                 zf.write(preview_path, arcname=preview_path.name)
 
@@ -1176,8 +2477,9 @@ class DXFSplitterGUI:
             messagebox.showinfo(
                 "Done",
                 "Generated outputs:\n"
-                f"{section_dir}\n\n"
+                f"{output_dir}\n\n"
                 f"ZIP: {zip_path}\n"
+                f"Placement CSV: {positions_csv_path}\n"
                 f"Preview: {preview_path}\n"
                 f"Manifest: {manifest_path}\n"
                 f"Config: {config_path}"
@@ -1187,7 +2489,26 @@ class DXFSplitterGUI:
             messagebox.showerror("Generation error", str(e))
 
 
+def validate_runtime() -> None:
+    if sys.platform != "darwin":
+        return
+
+    tk_version = tuple(int(part) for part in str(tk.TkVersion).split(".")[:2])
+    if tk_version >= (8, 6):
+        return
+
+    raise SystemExit(
+        "This Python is linked against Tk "
+        f"{tk.TkVersion}, which is not usable for this GUI on your macOS install.\n"
+        "Run the app with:\n"
+        "  ./.venv/bin/python dxf_spiral_splitter_gui_autochain.py\n"
+        "or configure your IDE to use:\n"
+        f"  {PROJECT_ROOT / '.venv/bin/python'}"
+    )
+
+
 def main():
+    validate_runtime()
     root = tk.Tk()
     app = DXFSplitterGUI(root)
     root.mainloop()
