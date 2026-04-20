@@ -40,7 +40,7 @@ import math
 import os
 import sys
 import zipfile
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -535,6 +535,27 @@ def line_intersection(p1: np.ndarray, d1: np.ndarray, p2: np.ndarray, d2: np.nda
     return p1 + t * d1
 
 
+def segment_intersection(
+    p0: np.ndarray,
+    p1: np.ndarray,
+    q0: np.ndarray,
+    q1: np.ndarray,
+    tol: float = 1e-12,
+) -> Optional[Tuple[np.ndarray, float, float]]:
+    r = p1 - p0
+    s = q1 - q0
+    denom = cross2d(r, s)
+    if abs(denom) < tol:
+        return None
+
+    qp = q0 - p0
+    t = cross2d(qp, s) / denom
+    u = cross2d(qp, r) / denom
+    if -tol <= t <= 1.0 + tol and -tol <= u <= 1.0 + tol:
+        return p0 + t * r, float(t), float(u)
+    return None
+
+
 def polyline_vertex_tangents(pts: np.ndarray, closed: bool = False) -> np.ndarray:
     pts = dedupe_consecutive_points(pts)
     if len(pts) < 2:
@@ -558,6 +579,83 @@ def polyline_vertex_tangents(pts: np.ndarray, closed: bool = False) -> np.ndarra
         tangents[i] = normalize_vector(next_pt - prev_pt)
 
     return tangents
+
+
+def offset_vertex_join(
+    base_point: np.ndarray,
+    prev_dir: np.ndarray,
+    curr_dir: np.ndarray,
+    prev_normal: np.ndarray,
+    curr_normal: np.ndarray,
+    distance: float,
+    miter_limit: float = 8.0,
+) -> np.ndarray:
+    prev_line_point = base_point + distance * prev_normal
+    curr_line_point = base_point + distance * curr_normal
+    inter = line_intersection(prev_line_point, prev_dir, curr_line_point, curr_dir)
+    if inter is not None:
+        miter_len = float(np.linalg.norm(inter - base_point))
+        if miter_len <= max(distance * miter_limit, distance + 1e-9):
+            return inter
+
+    avg_normal = normalize_vector(prev_normal + curr_normal)
+    if np.linalg.norm(avg_normal) < 1e-12:
+        avg_normal = curr_normal
+    return base_point + distance * avg_normal
+
+
+def trim_open_polyline_self_intersections(
+    points: np.ndarray,
+    tol: float = 1e-7,
+) -> np.ndarray:
+    pts = dedupe_consecutive_points(points, tol=tol)
+    if len(pts) < 4:
+        return pts
+
+    stack = [pts[0], pts[1]]
+    for point in pts[2:]:
+        stack.append(point)
+
+        while len(stack) >= 4:
+            found = False
+            seg_start = stack[-2]
+            seg_end = stack[-1]
+
+            for i in range(len(stack) - 3):
+                inter = segment_intersection(
+                    stack[i],
+                    stack[i + 1],
+                    seg_start,
+                    seg_end,
+                    tol=tol,
+                )
+                if inter is None:
+                    continue
+
+                inter_point, _t, _u = inter
+                prefix = [p.copy() for p in stack[:i + 1]]
+                if np.linalg.norm(prefix[-1] - inter_point) > tol:
+                    prefix.append(inter_point)
+                if np.linalg.norm(inter_point - seg_end) > tol:
+                    prefix.append(seg_end)
+                stack = prefix
+                found = True
+                break
+
+            if found:
+                continue
+
+            end_point = stack[-1]
+            for i in range(len(stack) - 3):
+                if np.linalg.norm(stack[i] - end_point) <= tol:
+                    stack = [p.copy() for p in stack[:i + 1]]
+                    found = True
+                    break
+
+            if not found:
+                break
+
+    return dedupe_consecutive_points(np.asarray(stack, dtype=float), tol=tol)
 
 
 def offset_polyline(points: np.ndarray, distance: float, sign: float, closed: bool = False) -> np.ndarray:
@@ -591,31 +689,35 @@ def offset_polyline(points: np.ndarray, distance: float, sign: float, closed: bo
         for i in range(n):
             prev_idx = (i - 1) % n
             curr_idx = i % n
-            prev_line_point = base[i] + distance * seg_normals[prev_idx]
-            curr_line_point = base[i] + distance * seg_normals[curr_idx]
-            inter = line_intersection(prev_line_point, seg_dirs[prev_idx], curr_line_point, seg_dirs[curr_idx])
-            if inter is None:
-                avg_normal = normalize_vector(seg_normals[prev_idx] + seg_normals[curr_idx])
-                if np.linalg.norm(avg_normal) < 1e-12:
-                    avg_normal = seg_normals[curr_idx]
-                inter = base[i] + distance * avg_normal
-            out.append(inter)
+            out.append(
+                offset_vertex_join(
+                    base[i],
+                    seg_dirs[prev_idx],
+                    seg_dirs[curr_idx],
+                    seg_normals[prev_idx],
+                    seg_normals[curr_idx],
+                    distance,
+                )
+            )
         out = np.asarray(out, dtype=float)
         return np.vstack([out, out[0]])
 
     out = [base[0] + distance * seg_normals[0]]
     for i in range(1, len(base) - 1):
-        prev_line_point = base[i] + distance * seg_normals[i - 1]
-        curr_line_point = base[i] + distance * seg_normals[i]
-        inter = line_intersection(prev_line_point, seg_dirs[i - 1], curr_line_point, seg_dirs[i])
-        if inter is None:
-            avg_normal = normalize_vector(seg_normals[i - 1] + seg_normals[i])
-            if np.linalg.norm(avg_normal) < 1e-12:
-                avg_normal = seg_normals[i]
-            inter = base[i] + distance * avg_normal
-        out.append(inter)
+        out.append(
+            offset_vertex_join(
+                base[i],
+                seg_dirs[i - 1],
+                seg_dirs[i],
+                seg_normals[i - 1],
+                seg_normals[i],
+                distance,
+            )
+        )
     out.append(base[-1] + distance * seg_normals[-1])
-    return np.asarray(out, dtype=float)
+    out = np.asarray(out, dtype=float)
+    # Tight inward offsets can create loops at small fillets; trim those so the exported path stays usable.
+    return trim_open_polyline_self_intersections(out, tol=max(distance * 1e-3, 1e-7))
 
 
 def estimate_offset_sign_away_from_reference(path_pts: np.ndarray, reference_cloud: np.ndarray) -> float:
@@ -990,6 +1092,117 @@ def effective_assignment_offset_signs(
     return [(-sign if item.kerf_flip else sign) for item, sign in zip(items, signs)]
 
 
+def cluster_endpoint_nodes(
+    paths: List[np.ndarray],
+    join_tolerance: float,
+) -> Tuple[List[np.ndarray], List[Tuple[int, int]]]:
+    node_points: List[np.ndarray] = []
+    node_members: List[List[np.ndarray]] = []
+    path_nodes: List[Tuple[int, int]] = []
+
+    def assign_node(point: np.ndarray) -> int:
+        for idx, center in enumerate(node_points):
+            if np.linalg.norm(point - center) <= join_tolerance:
+                node_members[idx].append(point)
+                node_points[idx] = np.mean(np.asarray(node_members[idx]), axis=0)
+                return idx
+
+        node_points.append(point.copy())
+        node_members.append([point.copy()])
+        return len(node_points) - 1
+
+    for pts in paths:
+        start_node = assign_node(pts[0])
+        end_node = assign_node(pts[-1])
+        path_nodes.append((start_node, end_node))
+
+    return node_points, path_nodes
+
+
+def connected_path_runs_by_sign(
+    paths: List[np.ndarray],
+    signs: List[float],
+    join_tolerance: float,
+) -> List[Tuple[List[np.ndarray], float]]:
+    if not paths:
+        return []
+
+    runs: List[Tuple[List[np.ndarray], float]] = []
+    by_sign: Dict[float, List[int]] = defaultdict(list)
+    for idx, sign in enumerate(signs):
+        by_sign[sign].append(idx)
+
+    for run_sign, sign_indices in by_sign.items():
+        sign_paths = [paths[idx] for idx in sign_indices]
+        _node_points, path_nodes = cluster_endpoint_nodes(sign_paths, join_tolerance)
+
+        adjacency: Dict[int, List[int]] = defaultdict(list)
+        degree: Dict[int, int] = defaultdict(int)
+        for local_idx, (node_a, node_b) in enumerate(path_nodes):
+            adjacency[node_a].append(local_idx)
+            adjacency[node_b].append(local_idx)
+            degree[node_a] += 1
+            degree[node_b] += 1
+
+        visited = set()
+
+        def walk(start_edge: int, start_node: int) -> List[np.ndarray]:
+            run_paths: List[np.ndarray] = []
+            edge_idx = start_edge
+            current_node = start_node
+
+            while True:
+                if edge_idx in visited:
+                    break
+
+                visited.add(edge_idx)
+                node_a, node_b = path_nodes[edge_idx]
+                pts = sign_paths[edge_idx]
+
+                if current_node == node_a:
+                    oriented = pts
+                    next_node = node_b
+                elif current_node == node_b:
+                    oriented = pts[::-1].copy()
+                    next_node = node_a
+                else:
+                    break
+
+                run_paths.append(oriented)
+                candidates = [idx for idx in adjacency[next_node] if idx not in visited]
+                if degree[next_node] != 2 or len(candidates) != 1:
+                    break
+
+                edge_idx = candidates[0]
+                current_node = next_node
+
+            return run_paths
+
+        endpoint_nodes = sorted([node for node, node_degree in degree.items() if node_degree != 2])
+        for node in endpoint_nodes:
+            for edge_idx in adjacency[node]:
+                if edge_idx in visited:
+                    continue
+                run_paths = walk(edge_idx, node)
+                if run_paths:
+                    runs.append((run_paths, run_sign))
+
+        for edge_idx, (node_a, _node_b) in enumerate(path_nodes):
+            if edge_idx in visited:
+                continue
+            run_paths = walk(edge_idx, node_a)
+            if run_paths:
+                runs.append((run_paths, run_sign))
+
+    return runs
+
+
+def kerf_path_join_tolerance(auto_gap: float) -> float:
+    # Kerf path stitching should only snap genuinely shared endpoints.
+    # Auto-chain gap can be much larger and will over-cluster tight-radius features.
+    return max(1e-6, min(float(auto_gap) * 0.05, 0.005))
+
+
 def smooth_signs_by_spatial_neighbors(paths: List[np.ndarray], signs: List[float], neighbor_count: int) -> List[float]:
     if len(paths) <= 1 or neighbor_count <= 0:
         return list(signs)
@@ -1031,28 +1244,10 @@ def offset_assignment_items_using_material_mask(
         fallback_spatial_neighbor_count=fallback_spatial_neighbor_count,
     )
 
-    stitched_runs: List[Tuple[np.ndarray, float]] = []
-    current_paths: List[np.ndarray] = []
-    current_sign: Optional[float] = None
-
-    for pts, final_sign in zip(paths, final_signs):
-        if not current_paths:
-            current_paths = [pts]
-            current_sign = final_sign
-            continue
-
-        prev_pts = current_paths[-1]
-        connected = np.linalg.norm(prev_pts[-1] - pts[0]) <= join_tolerance
-        if connected and current_sign == final_sign:
-            current_paths.append(pts)
-            continue
-
-        stitched_runs.append((merge_connected_paths(current_paths, join_tolerance), current_sign))
-        current_paths = [pts]
-        current_sign = final_sign
-
-    if current_paths and current_sign is not None:
-        stitched_runs.append((merge_connected_paths(current_paths, join_tolerance), current_sign))
+    stitched_runs = [
+        (merge_connected_paths(run_paths, join_tolerance), run_sign)
+        for run_paths, run_sign in connected_path_runs_by_sign(paths, final_signs, join_tolerance)
+    ]
 
     out = []
     for stitched_path, final_sign in stitched_runs:
@@ -1200,6 +1395,7 @@ class DXFSplitterGUI:
         self.auto_gap_var = tk.DoubleVar(value=0.5)
         self.kerf_mm_var = tk.DoubleVar(value=0.0)
         self.show_kerf_overlay_var = tk.BooleanVar(value=False)
+        self.show_segment_preview_var = tk.BooleanVar(value=False)
         self.show_labels_var = tk.BooleanVar(value=True)
         self.show_arrows_var = tk.BooleanVar(value=True)
         self.show_start_end_var = tk.BooleanVar(value=True)
@@ -1321,6 +1517,20 @@ class DXFSplitterGUI:
         ttk.Label(
             opt_frame,
             text="Controls how many DXFs each spring edge is split into. Default: 12.",
+            wraplength=360,
+            justify="left",
+        ).pack(fill="x", padx=4, pady=(0, 4))
+
+        ttk.Checkbutton(
+            opt_frame,
+            text="Show spring segment preview",
+            variable=self.show_segment_preview_var,
+            command=self.redraw_plot,
+        ).pack(anchor="w", padx=4, pady=2)
+
+        ttk.Label(
+            opt_frame,
+            text="Overlays the current upper/lower spring split and numbering in the plot using the current segment count.",
             wraplength=360,
             justify="left",
         ).pack(fill="x", padx=4, pady=(0, 4))
@@ -1621,11 +1831,13 @@ class DXFSplitterGUI:
             circle_paths.append(np.column_stack([cx + r * np.cos(th), cy + r * np.sin(th)]))
 
         midline_cloud = build_strip_midline_cloud(upper_edge, lower_edge)
-        join_tolerance = max(float(self.auto_gap_var.get()), 0.5)
+        auto_gap = float(self.auto_gap_var.get())
+        mask_join_tolerance = max(auto_gap, 0.5)
+        path_join_tolerance = kerf_path_join_tolerance(auto_gap)
         material_mask = build_material_mask(
             [upper_edge, lower_edge] + outer_paths + transition_paths + inner_paths + circle_paths,
             [midline_cloud],
-            join_tolerance=join_tolerance,
+            join_tolerance=mask_join_tolerance,
         )
 
         preview["upper"].extend(
@@ -1642,7 +1854,7 @@ class DXFSplitterGUI:
                 material_mask,
                 fallback_reference_cloud=midline_cloud,
                 fallback_spatial_neighbor_count=4,
-                join_tolerance=join_tolerance,
+                join_tolerance=path_join_tolerance,
             )
         )
 
@@ -1662,7 +1874,7 @@ class DXFSplitterGUI:
                 material_mask,
                 fallback_reference_cloud=np.vstack([midline_cloud, inner_cutout_cloud]) if len(inner_cutout_cloud) > 0 else midline_cloud,
                 fallback_spatial_neighbor_count=2,
-                join_tolerance=join_tolerance,
+                join_tolerance=path_join_tolerance,
             )
         )
 
@@ -1673,11 +1885,54 @@ class DXFSplitterGUI:
                 offset,
                 material_mask,
                 fallback_reference_cloud=inner_reference_cloud,
-                join_tolerance=join_tolerance,
+                join_tolerance=path_join_tolerance,
             )
         )
 
         return preview
+
+    def _build_spring_segment_preview_geometry(self) -> Optional[Dict[str, List[Tuple[int, np.ndarray]]]]:
+        if not self.entities:
+            return None
+
+        if not self.assignments["upper_edge"] or not self.assignments["lower_edge"]:
+            return None
+
+        try:
+            upper_edge = path_from_assignment_list(self.entities, self.assignments["upper_edge"])
+            lower_edge = path_from_assignment_list(self.entities, self.assignments["lower_edge"])
+            n_sections = int(self.n_sections_var.get())
+        except Exception:
+            return None
+
+        if n_sections < 1:
+            return None
+
+        u = np.linspace(0.0, 1.0, n_sections + 1)
+        upper_frags = [slice_polyline_by_fraction(upper_edge, u[i], u[i + 1]) for i in range(n_sections)]
+        lower_frags = [slice_polyline_by_fraction(lower_edge, u[i], u[i + 1]) for i in range(n_sections)]
+
+        outer_fixture_items, circle_items = self._split_outer_fixture_assignments()
+        outer_cloud = geometry_points_from_assignments(self.entities, outer_fixture_items)
+        circle_cloud = geometry_points_from_circles([(cx, cy, r) for _item, cx, cy, r in circle_items])
+        if len(circle_cloud) > 0:
+            outer_cloud = np.vstack([outer_cloud, circle_cloud]) if len(outer_cloud) > 0 else circle_cloud
+
+        inner_cloud = geometry_points_from_assignments(
+            self.entities,
+            self.assignments["inner_transition"] + self.assignments["inner_cutout"],
+        )
+
+        if len(inner_cloud) > 0 or len(outer_cloud) > 0:
+            upper_inner_to_outer = path_runs_inner_to_outer(upper_edge, inner_cloud, outer_cloud)
+            lower_inner_to_outer = path_runs_inner_to_outer(lower_edge, inner_cloud, outer_cloud)
+            upper_frags = upper_frags if upper_inner_to_outer else list(reversed(upper_frags))
+            lower_frags = lower_frags if lower_inner_to_outer else list(reversed(lower_frags))
+
+        return {
+            "upper": [(seg_num, pts) for seg_num, pts in enumerate(upper_frags, start=1)],
+            "lower": [(seg_num, pts) for seg_num, pts in enumerate(lower_frags, start=1)],
+        }
 
     def refresh_assignment_lists(self):
         for cat, lb in self.listboxes.items():
@@ -1917,6 +2172,53 @@ class DXFSplitterGUI:
                 (ymin - pad, ymax + pad),
             )
 
+        segment_preview_active = False
+        segment_preview_count = 0
+        if self.show_segment_preview_var.get():
+            try:
+                segment_preview = self._build_spring_segment_preview_geometry()
+            except Exception:
+                segment_preview = None
+            if segment_preview is not None:
+                upper_segments = segment_preview["upper"]
+                lower_segments = segment_preview["lower"]
+                segment_preview_count = max(len(upper_segments), len(lower_segments))
+                upper_cmap = plt.get_cmap("Blues")
+                lower_cmap = plt.get_cmap("Oranges")
+                overlay_style = dict(linewidth=3.6, alpha=0.9, zorder=5)
+
+                def segment_color(cmap, seg_num: int, total: int):
+                    frac = 0.0 if total <= 1 else (seg_num - 1) / (total - 1)
+                    return cmap(0.45 + 0.45 * frac)
+
+                for seg_num, pts in upper_segments:
+                    color = segment_color(upper_cmap, seg_num, len(upper_segments))
+                    self.ax.plot(pts[:, 0], pts[:, 1], color=color, **overlay_style)
+                    mid = pts[len(pts) // 2]
+                    self.ax.text(
+                        mid[0], mid[1], f"U{seg_num}",
+                        fontsize=7,
+                        color=color,
+                        ha="center", va="center",
+                        zorder=10,
+                        bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8),
+                    )
+
+                for seg_num, pts in lower_segments:
+                    color = segment_color(lower_cmap, seg_num, len(lower_segments))
+                    self.ax.plot(pts[:, 0], pts[:, 1], color=color, **overlay_style)
+                    mid = pts[len(pts) // 2]
+                    self.ax.text(
+                        mid[0], mid[1], f"L{seg_num}",
+                        fontsize=7,
+                        color=color,
+                        ha="center", va="center",
+                        zorder=10,
+                        bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8),
+                    )
+
+                segment_preview_active = True
+
         kerf_overlay_active = False
         kerf_mm = 0.0
         if self.show_kerf_overlay_var.get():
@@ -1959,6 +2261,8 @@ class DXFSplitterGUI:
 
         self.ax.set_aspect("equal", adjustable="box")
         title = "Click entities to assign them"
+        if segment_preview_active:
+            title += f" | solid overlay = spring segment preview ({segment_preview_count} per edge)"
         if kerf_overlay_active:
             title += f" | dashed overlay = exported kerf-adjusted paths ({kerf_mm:.3f} mm kerf)"
         self.ax.set_title(title)
@@ -2242,11 +2546,13 @@ class DXFSplitterGUI:
                 circle_paths.append(np.column_stack([cx + r * np.cos(th), cy + r * np.sin(th)]))
 
             midline_cloud = build_strip_midline_cloud(upper_edge, lower_edge)
-            join_tolerance = max(float(self.auto_gap_var.get()), 0.5)
+            auto_gap = float(self.auto_gap_var.get())
+            mask_join_tolerance = max(auto_gap, 0.5)
+            path_join_tolerance = kerf_path_join_tolerance(auto_gap)
             material_mask = build_material_mask(
                 [upper_edge, lower_edge] + outer_paths + transition_paths + inner_ring_paths + circle_paths,
                 [midline_cloud],
-                join_tolerance=join_tolerance,
+                join_tolerance=mask_join_tolerance,
             )
 
             if kerf_mm > 0.0:
@@ -2303,7 +2609,7 @@ class DXFSplitterGUI:
                         material_mask,
                         fallback_reference_cloud=midline_cloud,
                         fallback_spatial_neighbor_count=4,
-                        join_tolerance=join_tolerance,
+                        join_tolerance=path_join_tolerance,
                     )
                     outer_polylines = [
                         (pts, "OUTER_FIXTURE")
@@ -2346,7 +2652,7 @@ class DXFSplitterGUI:
                         material_mask,
                         fallback_reference_cloud=np.vstack([midline_cloud, inner_cutout_cloud]) if len(inner_cutout_cloud) > 0 else midline_cloud,
                         fallback_spatial_neighbor_count=2,
-                        join_tolerance=join_tolerance,
+                        join_tolerance=path_join_tolerance,
                     )
                     compensated_inner_ring_paths = offset_assignment_items_using_material_mask(
                         self.entities,
@@ -2354,7 +2660,7 @@ class DXFSplitterGUI:
                         kerf_offset,
                         material_mask,
                         fallback_reference_cloud=inner_reference_cloud,
-                        join_tolerance=join_tolerance,
+                        join_tolerance=path_join_tolerance,
                     )
                     inner_end_polylines = (
                         [(pts, "TRANSITION_REGION") for pts in compensated_transition_paths]
